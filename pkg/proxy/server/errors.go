@@ -40,5 +40,4 @@ var ErrToString = map[byte]string{
 
 	// Protocol packet errors
 	protocol.ErrInvalidPacket: "invalid protocol packet structure",
-	protocol.ErrInvalidCrypto: "invalid cryptographic operation",
 }

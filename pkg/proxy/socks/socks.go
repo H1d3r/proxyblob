@@ -5,10 +5,11 @@ package proxy
 
 import (
 	"context"
+	"io"
+	"net"
 	"slices"
 
 	"proxyblob/pkg/protocol"
-	"proxyblob/pkg/transport"
 
 	"github.com/google/uuid"
 )
@@ -20,11 +21,11 @@ type SocksHandler struct {
 	*protocol.BaseHandler
 }
 
-// NewSocksHandler creates a SOCKS5 handler with the given transport.
-// The transport is used for sending and receiving protocol messages.
-func NewSocksHandler(ctx context.Context, transport transport.Transport) *SocksHandler {
+// NewSocksHandler creates a SOCKS5 handler with the given connection.
+// The connection is used for sending and receiving protocol messages.
+func NewSocksHandler(ctx context.Context, conn net.Conn) *SocksHandler {
 	handler := &SocksHandler{}
-	handler.BaseHandler = protocol.NewBaseHandler(ctx, transport)
+	handler.BaseHandler = protocol.NewBaseHandler(ctx, conn)
 	handler.PacketHandler = handler
 	return handler
 }
@@ -54,27 +55,19 @@ func (h *SocksHandler) OnNew(connectionID uuid.UUID, data []byte) byte {
 	conn := protocol.NewConnection(connectionID)
 	h.Connections.Store(conn.ID, conn)
 
-	// Process the server's nonce and public key from data
-	if len(data) >= 24+32 {
-		// Extract nonce and server public key
-		nonce := data[:24]
-		serverPublicKey := data[24 : 24+32]
+	// Create the virtual protocol connection
+	conn.ProtocolConn = protocol.NewProtocolConn(h.Ctx, connectionID, h.BaseHandler)
+	conn.StartDelivery()
 
-		// Store temporary data for key derivation during ACK
-		tmp := make([]byte, len(nonce)+len(serverPublicKey))
-		copy(tmp[:len(nonce)], nonce)
-		copy(tmp[len(nonce):], serverPublicKey)
-		conn.SecretKey = tmp
-	}
-
-	// Send connection acknowledgment
-	errCode := h.SendConnAck(connectionID)
-	if errCode != protocol.ErrNone {
-		return errCode
-	}
-
-	// Process the connection
-	go h.processConnection(conn)
+	// Send ACK and process in a goroutine so ReceiveLoop never blocks on aznet writes
+	go func() {
+		errCode := h.SendConnAck(connectionID)
+		if errCode != protocol.ErrNone {
+			h.SendClose(connectionID, protocol.ErrConnectionClosed)
+			return
+		}
+		h.processConnection(conn)
+	}()
 	return protocol.ErrNone
 }
 
@@ -85,7 +78,7 @@ func (h *SocksHandler) OnAck(connectionID uuid.UUID, data []byte) byte {
 }
 
 // OnData processes incoming data for a connection.
-// It decrypts the data and forwards it to the connection's read buffer.
+// Data is forwarded directly (handled by transport layer).
 func (h *SocksHandler) OnData(connectionID uuid.UUID, data []byte) byte {
 	value, ok := h.Connections.Load(connectionID)
 	if !ok {
@@ -93,20 +86,13 @@ func (h *SocksHandler) OnData(connectionID uuid.UUID, data []byte) byte {
 	}
 	conn := value.(*protocol.Connection)
 
-	decrypted, errCode := protocol.Decrypt(conn.SecretKey, data)
-	if errCode != protocol.ErrNone {
-		h.SendClose(connectionID, protocol.ErrInvalidCrypto)
-		return errCode
+	// Non-blocking delivery to per-connection goroutine
+	if conn.ProtocolConn != nil {
+		if !conn.Deliver(data) {
+			return protocol.ErrBufferFull
+		}
 	}
-	data = decrypted
-
-	select {
-	case <-h.Ctx.Done():
-		return protocol.ErrConnectionClosed
-	case conn.ReadBuffer <- data:
-		return protocol.ErrNone
-
-	}
+	return protocol.ErrNone
 }
 
 // OnClose cleans up resources associated with a connection.
@@ -184,28 +170,52 @@ func (h *SocksHandler) SendError(conn *protocol.Connection, errCode byte) {
 // handleAuthNegotiation processes the client's authentication method selection.
 // Currently only the NO AUTHENTICATION REQUIRED (0x00) method is supported.
 func (h *SocksHandler) handleAuthNegotiation(conn *protocol.Connection) byte {
-	select {
-	case methods := <-conn.ReadBuffer:
-		// Currently we only support NoAuth (0x00)
-		if !slices.Contains(methods, NoAuth) {
-			h.SendError(conn, protocol.ErrAuthFailed)
-			return protocol.ErrAuthFailed
-		}
-
-		// Send response
-		errCode := h.SendData(conn.ID, []byte{Version5, NoAuth})
-		if errCode != protocol.ErrNone {
-			return errCode
-		}
-
-		return protocol.ErrNone
-
-	case <-conn.Closed:
+	// Read SOCKS5 auth packet: [version(1)][nmethods(1)][methods(nmethods)]
+	// Use stack allocation for small fixed-size header
+	var headerBuf [2]byte
+	header := headerBuf[:]
+	if _, err := io.ReadFull(conn.ProtocolConn, header); err != nil {
 		return protocol.ErrConnectionClosed
-
-	case <-h.Ctx.Done():
-		return protocol.ErrHandlerStopped
 	}
+
+	// Check version
+	if header[0] != Version5 {
+		return protocol.ErrInvalidSocksVersion
+	}
+
+	// Read methods
+	nmethods := int(header[1])
+	if nmethods == 0 {
+		return protocol.ErrInvalidPacket
+	}
+
+	// Use stack buffer for typical case (most clients send 1-2 methods)
+	// Max nmethods is 255, but allocate reasonable stack space
+	var methodsBuf [4]byte
+	var methods []byte
+	if nmethods <= 4 {
+		methods = methodsBuf[:nmethods]
+	} else {
+		methods = make([]byte, nmethods)
+	}
+	if _, err := io.ReadFull(conn.ProtocolConn, methods); err != nil {
+		return protocol.ErrConnectionClosed
+	}
+
+	// Currently we only support NoAuth (0x00)
+	if !slices.Contains(methods, NoAuth) {
+		h.SendError(conn, protocol.ErrAuthFailed)
+		return protocol.ErrAuthFailed
+	}
+
+	// Send response
+	response := []byte{Version5, NoAuth}
+	errCode := h.SendData(conn.ID, response)
+	if errCode != protocol.ErrNone {
+		return protocol.ErrConnectionClosed
+	}
+
+	return protocol.ErrNone
 }
 
 // handleCommand processes SOCKS5 commands from the client.
@@ -218,40 +228,76 @@ func (h *SocksHandler) handleAuthNegotiation(conn *protocol.Connection) byte {
 //
 //   - BIND (0x02): TCP/IP port binding
 func (h *SocksHandler) handleCommand(conn *protocol.Connection) byte {
-	select {
-	case cmdData := <-conn.ReadBuffer:
-		// Validate command format
-		if len(cmdData) < 4 {
-			h.SendError(conn, protocol.ErrInvalidPacket)
-			return protocol.ErrInvalidPacket
-		}
-
-		// Check SOCKS version
-		if cmdData[0] != Version5 {
-			h.SendError(conn, protocol.ErrInvalidSocksVersion)
-			return protocol.ErrInvalidSocksVersion
-		}
-
-		var errCode byte
-		switch cmdData[1] {
-		case Connect:
-			errCode = h.handleConnect(conn, cmdData)
-		case Bind:
-			errCode = h.handleBind(conn, cmdData)
-		case UDPAssociate:
-			errCode = h.handleUDPAssociate(conn)
-		default:
-			h.SendError(conn, protocol.ErrUnsupportedCommand)
-			return protocol.ErrUnsupportedCommand
-		}
-
-		return errCode
-
-	case <-conn.Closed:
+	// Read SOCKS5 command header: [version(1)][cmd(1)][rsv(1)][atyp(1)]
+	// Use stack allocation for fixed-size header
+	var headerBuf [4]byte
+	header := headerBuf[:]
+	if _, err := io.ReadFull(conn.ProtocolConn, header); err != nil {
 		return protocol.ErrConnectionClosed
-	case <-h.Ctx.Done():
-		return protocol.ErrHandlerStopped
 	}
+
+	// Check SOCKS version
+	if header[0] != Version5 {
+		h.SendError(conn, protocol.ErrInvalidSocksVersion)
+		return protocol.ErrInvalidSocksVersion
+	}
+
+	cmd := header[1]
+	atyp := header[3]
+
+	// Read address based on address type
+	var addr []byte
+	switch atyp {
+	case IPv4:
+		// Use stack allocation for IPv4 (6 bytes: 4 IP + 2 port)
+		var addrBuf [6]byte
+		addr = addrBuf[:]
+	case IPv6:
+		// Use stack allocation for IPv6 (18 bytes: 16 IP + 2 port)
+		var addrBuf [18]byte
+		addr = addrBuf[:]
+	case Domain:
+		// Read domain length first
+		var lenBuf [1]byte
+		if _, err := io.ReadFull(conn.ProtocolConn, lenBuf[:]); err != nil {
+			return protocol.ErrConnectionClosed
+		}
+		domainLen := int(lenBuf[0])
+		// Domain name can be up to 255 bytes, use heap allocation
+		addr = make([]byte, 1+domainLen+2) // length + domain + port
+		addr[0] = lenBuf[0]
+		if _, err := io.ReadFull(conn.ProtocolConn, addr[1:]); err != nil {
+			return protocol.ErrConnectionClosed
+		}
+	default:
+		h.SendError(conn, protocol.ErrAddressNotSupported)
+		return protocol.ErrAddressNotSupported
+	}
+
+	// Read the address and port
+	if atyp != Domain {
+		if _, err := io.ReadFull(conn.ProtocolConn, addr); err != nil {
+			return protocol.ErrConnectionClosed
+		}
+	}
+
+	// Build complete command data for handlers
+	cmdData := append(header, addr...)
+
+	var errCode byte
+	switch cmd {
+	case Connect:
+		errCode = h.handleConnect(conn, cmdData)
+	case Bind:
+		errCode = h.handleBind(conn, cmdData)
+	case UDPAssociate:
+		errCode = h.handleUDPAssociate(conn)
+	default:
+		h.SendError(conn, protocol.ErrUnsupportedCommand)
+		return protocol.ErrUnsupportedCommand
+	}
+
+	return errCode
 }
 
 // handleDataTransfer manages the flow of data between client and target.

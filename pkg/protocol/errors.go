@@ -2,7 +2,8 @@
 package protocol
 
 import (
-	"proxyblob/pkg/transport"
+	"errors"
+	"net"
 )
 
 // Protocol error codes for agent-server communication.
@@ -21,11 +22,12 @@ const (
 	ErrPacketSendFailed   byte = 14 // Packet transmission failed
 	ErrHandlerStopped     byte = 15 // Protocol handler is not running
 	ErrUnexpectedPacket   byte = 16 // Received unexpected packet type
+	ErrBufferFull         byte = 17 // Per-connection delivery buffer is full
 
 	// Transport errors (20-29)
-	ErrTransportClosed  byte = transport.ErrTransportClosed  // Transport layer terminated
-	ErrTransportTimeout byte = transport.ErrTransportTimeout // Transport operation timed out
-	ErrTransportError   byte = transport.ErrTransportError   // Transport operation failed
+	ErrTransportClosed  byte = 20 // Transport layer terminated
+	ErrTransportTimeout byte = 21 // Transport operation timed out
+	ErrTransportError   byte = 22 // Transport operation failed
 
 	// SOCKS errors (30-39)
 	ErrInvalidSocksVersion byte = 30 // Unsupported SOCKS protocol version
@@ -40,5 +42,45 @@ const (
 
 	// Packet errors (40-49)
 	ErrInvalidPacket byte = 40 // Malformed packet structure
-	ErrInvalidCrypto byte = 41 // Cryptographic operation failed
 )
+
+// MapNetError converts a network error to an appropriate protocol error code.
+// This consolidates error mapping logic used throughout the codebase.
+func MapNetError(err error) byte {
+	if err == nil {
+		return ErrNone
+	}
+
+	// Check for timeout
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return ErrTTLExpired
+	}
+
+	// Check for net.OpError (most common network error type)
+	if opErr, ok := err.(*net.OpError); ok {
+		if errors.Is(opErr, net.ErrClosed) {
+			return ErrTransportClosed
+		}
+		switch opErr.Op {
+		case "dial":
+			return ErrNetworkUnreachable
+		case "read", "write":
+			return ErrHostUnreachable
+		case "listen":
+			return ErrNetworkUnreachable
+		}
+	}
+
+	// Check for DNS errors
+	if _, ok := err.(*net.DNSError); ok {
+		return ErrHostUnreachable
+	}
+
+	// Check for closed connection
+	if errors.Is(err, net.ErrClosed) {
+		return ErrTransportClosed
+	}
+
+	// Default to connection refused
+	return ErrConnectionRefused
+}

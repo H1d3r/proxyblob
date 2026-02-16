@@ -2,10 +2,10 @@ package protocol
 
 import (
 	"context"
+	"io"
+	"net"
 	"sync"
 	"time"
-
-	"proxyblob/pkg/transport"
 
 	"github.com/google/uuid"
 )
@@ -38,8 +38,8 @@ type PacketHandler interface {
 // BaseHandler implements common protocol functionality for proxy and agent.
 // It provides connection management, packet routing, and error handling.
 type BaseHandler struct {
-	// transport handles underlying packet transmission
-	transport transport.Transport
+	// conn handles underlying packet transmission (direct net.Conn)
+	conn net.Conn
 
 	// Connections maps UUIDs to active Connection objects
 	Connections sync.Map
@@ -50,70 +50,95 @@ type BaseHandler struct {
 	// Cancel terminates handler context
 	Cancel context.CancelFunc
 
+	// OnReceive is called on every successful packet read (optional)
+	OnReceive func()
+
 	// PacketHandler routes packets to specific handlers
 	PacketHandler
 }
 
-// NewBaseHandler creates a handler with specified context and transport.
+// NewBaseHandler creates a handler with specified context and connection.
 // Uses background context if parent context is nil.
-func NewBaseHandler(parentCtx context.Context, transport transport.Transport) *BaseHandler {
+func NewBaseHandler(parentCtx context.Context, conn net.Conn) *BaseHandler {
 	if parentCtx == nil {
 		parentCtx = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &BaseHandler{
-		transport: transport,
-		Ctx:       ctx,
-		Cancel:    cancel,
+		conn:   conn,
+		Ctx:    ctx,
+		Cancel: cancel,
 	}
 }
 
-// ReceiveLoop processes incoming packets until context cancellation.
-// Implements exponential backoff for consecutive errors.
+// ReceiveLoop processes incoming packets until EOF or context cancellation.
+// Uses exponential backoff on transient errors but never exits silently.
 func (h *BaseHandler) ReceiveLoop() {
 	consecutiveErrors := 0
-	maxConsecutiveErrors := 5
+	const maxBackoff = 5 * time.Second
+
+	// NOTE: aznet already handles message framing and returns complete messages
+	// We don't need stream buffering - each Read() returns ONE complete message
+
+	// Allocate buffer once and reuse it (16MB is the max frame size in aznet)
+	buffer := make([]byte, 16*1024*1024)
 
 	for {
 		select {
 		case <-h.Ctx.Done():
 			return
 		default:
-			data, errCode := h.transport.Receive(h.Ctx)
-			if errCode != ErrNone {
-				if h.transport.IsClosed(errCode) {
-					h.Stop()
-					return
-				}
+		}
 
-				if h.Ctx.Err() == nil && errCode != ErrTransportError {
-					consecutiveErrors++
-					if consecutiveErrors == maxConsecutiveErrors {
-						return // Too many errors, just exit
-					}
-					time.Sleep(time.Duration(consecutiveErrors*50) * time.Millisecond)
-				}
+		// Read directly from connection (aznet handles framing)
+		n, err := h.conn.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				h.Stop()
+				return
+			}
+
+			if h.Ctx.Err() != nil {
+				return
+			}
+
+			// Transient error: exponential backoff (100ms, 200ms, 400ms, ... capped at 5s)
+			consecutiveErrors++
+			backoff := time.Duration(100<<uint(consecutiveErrors-1)) * time.Millisecond
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			// Interruptible sleep
+			select {
+			case <-h.Ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			continue
+		}
+
+		consecutiveErrors = 0
+		if h.OnReceive != nil {
+			h.OnReceive()
+		}
+		data := buffer[:n]
+
+		if len(data) == 0 {
+			continue
+		}
+
+		packet := Decode(data)
+		if packet == nil {
+			continue
+		}
+
+		errCode := h.handlePacket(packet)
+		if errCode != ErrNone {
+			if h.Ctx.Err() != nil {
 				continue
 			}
-
-			consecutiveErrors = 0
-
-			if len(data) == 0 {
-				continue
-			}
-
-			packet := Decode(data)
-			if packet == nil {
-				continue
-			}
-
-			errCode = h.handlePacket(packet)
-			if errCode != ErrNone {
-				if h.Ctx.Err() != nil && errCode == ErrConnectionClosed {
-					continue
-				}
-				h.SendClose(packet.ConnectionID, errCode)
-			}
+			// Async close dispatch to avoid blocking ReceiveLoop on aznet writes
+			go h.SendClose(packet.ConnectionID, errCode)
 		}
 	}
 }
@@ -135,73 +160,25 @@ func (h *BaseHandler) handlePacket(packet *Packet) byte {
 	}
 }
 
-// SendNewConnection initiates key exchange for new connection.
+// SendNewConnection initiates a new connection.
 // Returns error code indicating success or specific failure.
 func (h *BaseHandler) SendNewConnection(connectionID uuid.UUID) byte {
-	privateKey, publicKey := GenerateKeyPair()
-	nonce := GenerateNonce()
-
-	connObj, exists := h.Connections.Load(connectionID)
-	if !exists {
-		return ErrConnectionNotFound
-	}
-	conn := connObj.(*Connection)
-
-	// Store nonce and private key for key derivation during ACK
-	tempData := make([]byte, len(nonce)+len(privateKey))
-	copy(tempData[:len(nonce)], nonce)
-	copy(tempData[len(nonce):], privateKey)
-	conn.SecretKey = tempData
-
-	// Send nonce and public key to peer
-	data := make([]byte, len(nonce)+len(publicKey))
-	copy(data[:len(nonce)], nonce)
-	copy(data[len(nonce):], publicKey)
-
-	return h.sendPacket(CmdNew, connectionID, data)
+	return h.sendPacket(CmdNew, connectionID, nil)
 }
 
-// SendConnAck completes key exchange by deriving shared key.
+// SendConnAck acknowledges connection.
 // Returns error code indicating success or specific failure.
 func (h *BaseHandler) SendConnAck(connectionID uuid.UUID) byte {
-	connObj, exists := h.Connections.Load(connectionID)
-	if !exists {
-		return ErrConnectionNotFound
-	}
-	conn := connObj.(*Connection)
-
-	privateKey, publicKey := GenerateKeyPair()
-
-	// The first 24 bytes of SecretKey should be the nonce,
-	// and the server's public key should be in the data field from OnNew
-	serverData := conn.SecretKey
-	nonce := serverData[:24]
-	serverPublicKey := serverData[24:]
-
-	symmetricKey, errCode := DeriveKey(privateKey, serverPublicKey, nonce)
-	if errCode != ErrNone {
-		return errCode
-	}
-
-	conn.SecretKey = symmetricKey
-
-	// Send public key in CmdAck
-	return h.sendPacket(CmdAck, connectionID, publicKey)
+	return h.sendPacket(CmdAck, connectionID, nil)
 }
 
+// SendData sends data.
+// Returns error code indicating success or specific failure.
 func (h *BaseHandler) SendData(connectionID uuid.UUID, data []byte) byte {
-	// Get connection
-	connObj, exists := h.Connections.Load(connectionID)
-	if !exists {
+	// Verify connection exists
+	if _, exists := h.Connections.Load(connectionID); !exists {
 		return ErrConnectionNotFound
 	}
-	conn := connObj.(*Connection)
-
-	encrypted, errCode := Encrypt(conn.SecretKey, data)
-	if errCode != ErrNone {
-		return errCode
-	}
-	data = encrypted
 
 	return h.sendPacket(CmdData, connectionID, data)
 }
@@ -215,6 +192,7 @@ func (h *BaseHandler) SendClose(connectionID uuid.UUID, errCode byte) byte {
 	conn := connObj.(*Connection)
 
 	conn.Close()
+	h.Connections.Delete(connectionID)
 	return h.sendPacket(CmdClose, connectionID, []byte{errCode})
 }
 
@@ -235,13 +213,12 @@ func (h *BaseHandler) sendPacket(cmd byte, connectionID uuid.UUID, data []byte) 
 		return ErrInvalidPacket
 	}
 
-	errCode := h.transport.Send(h.Ctx, encoded)
-	if errCode != ErrNone {
-		// Check if this is a transport closure
-		if h.transport.IsClosed(errCode) {
+	_, err := h.conn.Write(encoded)
+	if err != nil {
+		if err == io.EOF {
 			return ErrTransportClosed
 		}
-		return ErrPacketSendFailed
+		return ErrTransportError
 	}
 
 	return ErrNone
@@ -250,15 +227,8 @@ func (h *BaseHandler) sendPacket(cmd byte, connectionID uuid.UUID, data []byte) 
 func (h *BaseHandler) CloseAllConnections() {
 	h.Connections.Range(func(key, value interface{}) bool {
 		conn := value.(*Connection)
-
-		// Only notify if not already closed
-		select {
-		case <-conn.Closed:
-			// Already closed
-		default:
-			conn.Close()
-		}
-
+		conn.Close()
+		h.Connections.Delete(key)
 		return true
 	})
 }

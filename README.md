@@ -1,30 +1,32 @@
-# ProxyBlob
+# ProxyBlob v2
+
+🎉 New release ! _see [CHANGELOG](#changelog)_ 🎉
 
 <p align="center">
-  <img src="docs/logo.png" alt="ProxyBlob logo" width="300"/>
+  <img src="docs/proxyblob-v2.png" alt="ProxyBlob v2 logo" width="300"/>
 </p>
-<p align="center"><i>SOCKS proxy over Azure Storage Blob service</i></p>
+<p align="center"><i>SOCKS proxy over Azure Storage service</i></p>
 
 ## Overview
 
-ProxyBlob is a tool designed to create SOCKS proxy tunnels through Azure Blob Storage service. This is particularly useful in environments where direct network connectivity is restricted but `*.blob.core.windows.net` is accessible.
+ProxyBlob is a tool designed to create SOCKS proxy tunnels through Azure Storage services. This is particularly useful in environments where direct network connectivity is restricted but `*.core.windows.net` is accessible.
 
 The system consists of two components:
 
-1. **Proxy Server**: Runs on your local machine and provides a SOCKS interface for your applications
-2. **Agent**: Runs inside the target network and communicates with the proxy through Azure Blob Storage
+1. **Proxy Server**: Runs on your local machine or a remote server and provides a SOCKS interface for your applications
+2. **Agent**: Runs inside the target network and communicates with the proxy through Azure Storage services
 
 ## Features
 
 - SOCKS5 protocol (CONNECT and UDP ASSOCIATE)
-- Communication through Azure Blob Storage
+- Communication through Azure Storage services (thanks to [aznet](https://github.com/atsika/aznet)!)
 - Interactive CLI with auto-completion
 - Multiple agent management
-- Local proxy server
+- Local or remote proxy server
 
 ## Prerequisites
 
-- Go 1.23 or higher
+- Go 1.25 or higher
 - An Azure Storage Account
 
 ### Storage Account
@@ -108,7 +110,7 @@ Press on the `[Azurite Blob Service]` and the service should be running.
 
 For Docker, you will have to pull the image and run it:
 
-```
+```bash
 docker pull mcr.microsoft.com/azure-storage/azurite
 docker run -p 10000:10000 mcr.microsoft.com/azure-storage/azurite
 ```
@@ -137,11 +139,27 @@ Create a `config.json` file based on the [example](example_config.json) with you
 
 ```json
 {
-  "storage_url": "http://localhost:10000/", // omit if using Azure
-  "storage_account_name": "your-storage-account-name",
-  "storage_account_key": "your-storage-account-key"
+  "listeners": [
+    {
+      "name": "blob-listener",
+      "driver": "azblob",
+      "address": "https://proxyblob.blob.core.windows.net",
+      "storage_account": "proxyblob",
+      "storage_account_key": "your_account_key"
+    },
+    {
+      "name": "queue-listener",
+      "driver": "azqueue",
+      "address": "http://127.0.0.1:10001",
+      "storage_account": "devstoreaccount1",
+      "storage_account_key": "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+    }
+  ]
 }
+
 ```
+
+You can configure multiple listeners and manage them in the proxy CLI.
 
 ## Usage
 
@@ -155,43 +173,46 @@ This will start an interactive CLI with the following commands:
 
 ```
 Commands:
-  clear         clear the screen
-  create, new   create a new agent container and generate its connection string
-  delete, rm    delete an existing agent container
-  exit          exit the shell
-  help          use 'help [command]' for command help
-  list, ls      list all existing agent containers
-  select, use   select an agent for subsequent commands
-  start, proxy  start SOCKS proxy server
-  stop          stop running proxy for the selected agent
+  agent     manage agents
+  clear     clear the screen
+  exit      exit the shell
+  help      use 'help [command]' for command help
+  listener  manage listeners
+  new       generate a new connection string for an agent
 ```
 
-Once the proxy server is running, you can create a new agent container by using the `create` command.
+Once the proxy server is running, start a listener. The started listener automatically becomes the default for subsequent commands.
 
 ```
-proxyblob » create
-16:28:37 INF Agent container created successfully container_id=5f5250e9-5518-4682-90ea-f61abf797654
-16:28:37 INF Connection string generated connection_string=aHR0cDovL2xvY2FsaG9zdDoxMDAwMC9kZXZzdG9yZWFjY291bnQxLzVmNTI1MGU5LTU1MTgtNDY4Mi05MGVhLWY2MWFiZjc5NzY1ND9zZT0yMDI1LTA0LTI0VDE0JTNBMjglM0EzN1omc2lnPXpjNUNVYVZKJTJGS1duY3RtbnlNZ0clMkZZNkNrRzZHYXJzMXRFTXkxR0ZiTVVZJTNEJnNwPXJ3JnNwcj1odHRwcyUyQ2h0dHAmc3I9YyZzdD0yMDI1LTA0LTE3VDE0JTNBMjMlM0EzN1omc3Y9MjAyMC0xMC0wMg
+proxyblob » listener start blob-local-listener
+21:23:25 INF Aznet listener started and set as default addr=http://127.0.0.1:10000 driver=azblob listener_id=blob-local-listener
 ```
 
-Use the connection string generated with the agent (see below [Starting the Agent](#starting-the-agent)). If the agent connects successfully, you should see the “Agent Info” column filled in when you list the agents with the `list` command.
+Then you can generate a connection string by using the `new` command.
 
 ```
-proxyblob » list
-╭──────────────────────────────────────┬────────────┬────────────┬─────────────────────┬─────────────────────╮
-│ CONTAINER ID                         │ AGENT INFO │ PROXY PORT │ FIRST SEEN          │ LAST SEEN           │
-├──────────────────────────────────────┼────────────┼────────────┼─────────────────────┼─────────────────────┤
-│ 5f5250e9-5518-4682-90ea-f61abf797654 │ atsika@qb  │            │ 2025-04-17 14:28:37 │ 2025-04-17 14:28:37 │
-╰──────────────────────────────────────┴────────────┴────────────┴─────────────────────┴─────────────────────╯
+proxyblob » new
+21:25:10 INF Connection string generated connection_string=YXpibG9ifGh0dHA6Ly8xMjcuMC4wLjE6MTAwMDAvZGV2c3RvcmVhY2NvdW50MT9oYW5kc2hha2U9YzJVOU1qQXlOaTB3TWkweE5sUXlNQ1V6UVRJMUpUTkJNVEJhSm5OcFp6MDRlR3ByVjJFeVNXdHhWWEJxUlU1cGJIVmtOVGhuWXpkNU5raDNXWEZNUmpZNVFrNDVaMUphT1ZNMEpUTkVKbk53UFdGamR5WnpjSEk5YUhSMGNITWxNa05vZEhSd0puTnlQV01tYzNROU1qQXlOaTB3TWkweE5WUXlNQ1V6UVRJd0pUTkJNVEJhSm5OMlBUSXdNalV0TVRFdE1EVSUzRCZ0b2tlbj1jMlU5TWpBeU5pMHdNaTB4TmxReU1DVXpRVEkxSlROQk1UQmFKbk5wWnowM2NXZ3dZVWgxV1dKTE1rcGlOVVYyVG5WTk1XdEpTMFJFVTFkVGNFWlllVXd5ZUV0dWRYaG9jVWc0SlRORUpuTndQWEpzSm5Od2NqMW9kSFJ3Y3lVeVEyaDBkSEFtYzNJOVl5WnpkRDB5TURJMkxUQXlMVEUxVkRJd0pUTkJNakFsTTBFeE1Gb21jM1k5TWpBeU5TMHhNUzB3TlElM0QlM0Q listener_id=blob-local-listener
 ```
 
-Select the agent using `select <container id>` and start the proxy listener (by default it listens on localhost:1080) by using the `start` command. 
+Use the generated connection string with the agent (see below [Starting the Agent](#starting-the-agent)). If the agent connects successfully, you should see its identity (`user@host`) in the "Info" column when you list agents.
 
 ```
-atsika@qb » select 5f5250e9-5518-4682-90ea-f61abf797654
-17:17:51 INF Agent selected agent=atsika@qb
-atsika@qb » start
-17:17:58 INF Proxy started successfully agent=atsika@qb port=1080
+proxyblob » agent ls
+╭──────────────────────────────────────┬─────────────────┬──────────────────────┬────────────┬─────────────────────┬───────────╮
+│ AGENT ID                             │ INFO            │ LISTENER             │ PROXY PORT │ CONNECTED AT        │ LAST SEEN │
+├──────────────────────────────────────┼─────────────────┼──────────────────────┼────────────┼─────────────────────┼───────────┤
+│ 7b5af883-7cc7-45a4-8599-da906753005d │ atsika@mac.home │ blob-local-listener  │ 1080       │ 2026-02-15 21:50:04 │ 2m ago    │
+╰──────────────────────────────────────┴─────────────────┴──────────────────────┴────────────┴─────────────────────┴───────────╯
+```
+
+Select the agent using `agent select <agent-id>` and start the proxy listener (by default it listens on localhost:1080) by using the `agent start` command.
+
+```
+proxyblob » agent select 7b5af883-7cc7-45a4-8599-da906753005d
+22:10:40 INF Agent selected agent_id=7b5af883-7cc7-45a4-8599-da906753005d
+7b5af883 » agent start
+22:10:46 INF Proxy started agent_id=7b5af883-7cc7-45a4-8599-da906753005d port=1080
 ```
 
 You can now use for example [proxychains](https://github.com/rofl0r/proxychains-ng) to tunnel the traffic through the SOCKS proxy.
@@ -269,7 +290,7 @@ graph TB
     TransportA -->|Decode Packets| SocksHandler
     SocksHandler -->|Process Commands| CommandProcessor
     
-    %% Command Processing - Fixed syntax
+    %% Command Processing
     subgraph "Command Processing"
         Connect["CONNECT"]
         Bind["TODO: BIND"]
@@ -341,14 +362,17 @@ sequenceDiagram
 **Why does my agent immediately stop running ?**
 
 There might be several reasons why your agent stops immediately after you run it. Check its exit code:
+
 ```sh
 # Bash
 echo $?
 ```
+
 ```cmd
 REM CMD
 echo %ERRORLEVEL%
 ```
+
 ```pwsh
 # PowerShell
 echo $LastExitCode
@@ -362,8 +386,6 @@ Each exit code describes why the agent stopped running:
 | 1         | The context has been canceled               |
 | 2         | The connection string is missing            |
 | 3         | The connection string is invalid or expired |
-| 4         | The agent failed to write its metadata      |
-| 5         | The agent container is not found            |
 
 If you encounter issues:
 
@@ -374,10 +396,41 @@ If you encounter issues:
 
 ## TODO
 
-- BIND command implementation (currently not working)
-- Enhanced error handling and recovery
-- Improve proxy speed
+- BIND command (not implemented yet)
+- Improve proxy speed even more
+
+## CHANGELOG
+
+**ProxyBlob v2 (aznet boosted) - 16/02/2026:**
+
+- Complete architecture rewrite using aznet networking layer
+- Multiple Azure Storage backends (Blob, Queue, Table Storage)
+- Last seen timestamps for connected agents
+- Enhanced connection management and lifecycle
+- Better error handling and recovery mechanisms
+- Improved polling efficiency with adaptive intervals
+- Automatic connection cleanup and resource management
+- Significantly higher throughput and lower latency
+- Cost optimization through backend selection
+- Multi-listener configuration support
+
+**ProxyBlob public release - 29/04/2025:**
+
+- SOCKS5 protocol (CONNECT and UDP ASSOCIATE)
+- Reverse client-server architecture
+- Azure Blob Storage communication
+- Interactive CLI with auto-completion
+- Multi-agent management
+- Local or remote proxy server
+- Container-based communication
+- Connection string authentication
+- Error handling
+- Azurite support for local development
 
 ## License
 
 [GNU GPLv3 License](LICENSE)
+
+---
+
+Made with ❤️ by [@_atsika](https://x.com/_atsika)

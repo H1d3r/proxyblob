@@ -1,6 +1,5 @@
 // Package protocol implements the communication protocol between proxy server and agent.
-// It provides packet encoding/decoding, connection management, and secure data transfer
-// using ChaCha20-Poly1305.
+// It provides packet encoding/decoding and connection management.
 //
 // The protocol uses a binary packet format with fixed-size headers and variable-length
 // payloads. Each packet contains a command type, connection ID, and optional data.
@@ -51,6 +50,11 @@ func NewPacket(command byte, connectionID uuid.UUID, data []byte) *Packet {
 	}
 }
 
+// EncodedSize returns the total size of the encoded packet in bytes.
+func (p *Packet) EncodedSize() int {
+	return HeaderSize + len(p.Data)
+}
+
 // Encode serializes the packet into a byte slice following the protocol format.
 // Returns nil if any encoding operation fails.
 func (p *Packet) Encode() []byte {
@@ -78,8 +82,8 @@ func (p *Packet) Encode() []byte {
 }
 
 // Decode deserializes a byte slice into a protocol packet.
-// Returns nil if the data is malformed, incomplete, or contains an invalid command.
-// The input must contain at least HeaderSize bytes and match the encoded length.
+// Returns nil if the data is malformed or contains an invalid command.
+// The input must be EXACTLY one complete packet (aznet ensures this).
 func Decode(data []byte) *Packet {
 	if len(data) < HeaderSize {
 		return nil
@@ -94,6 +98,8 @@ func Decode(data []byte) *Packet {
 	copy(id[:], data[CommandSize:CommandSize+UUIDSize])
 
 	dataLength := binary.BigEndian.Uint32(data[CommandSize+UUIDSize : HeaderSize])
+
+	// Check exact size - aznet returns complete messages, so size must match exactly
 	if uint32(len(data)) != uint32(HeaderSize)+dataLength {
 		return nil
 	}

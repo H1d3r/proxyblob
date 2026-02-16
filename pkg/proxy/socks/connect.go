@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -36,38 +38,33 @@ func (h *SocksHandler) handleConnect(conn *protocol.Connection, cmdData []byte) 
 		return errCode
 	}
 
+	fmt.Printf("[CONNECT] %s\n", target)
+
 	// Establish TCP connection to target
 	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
-		// Map network error to appropriate SOCKS5 error code
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			errCode = protocol.ErrTTLExpired
-		} else if opErr, ok := err.(*net.OpError); ok {
-			if opErr.Op == "dial" {
-				errCode = protocol.ErrNetworkUnreachable
-			} else if opErr.Op == "read" {
-				errCode = protocol.ErrHostUnreachable
-			}
-		} else if _, ok := err.(*net.DNSError); ok {
-			errCode = protocol.ErrHostUnreachable
-		} else {
-			errCode = protocol.ErrConnectionRefused
-		}
-
-		// Send failure response with appropriate code
+		// Map network error to appropriate protocol error code
+		errCode = protocol.MapNetError(err)
 		h.SendError(conn, errCode)
 		return errCode
 	}
 
+	// Enable TCP_NODELAY to disable Nagle's algorithm for better TLS performance
+	if tcpConn, ok := targetConn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
 	// Send success response
+	// Use stack allocation for fixed-size response (10 bytes)
 	localAddr := targetConn.LocalAddr().(*net.TCPAddr)
-	response := make([]byte, 10)
-	response[0] = Version5
-	response[1] = Succeeded
-	response[2] = 0x00
-	response[3] = IPv4
-	copy(response[4:8], localAddr.IP.To4())
-	binary.BigEndian.PutUint16(response[8:], uint16(localAddr.Port))
+	var responseBuf [10]byte
+	responseBuf[0] = Version5
+	responseBuf[1] = Succeeded
+	responseBuf[2] = 0x00
+	responseBuf[3] = IPv4
+	copy(responseBuf[4:8], localAddr.IP.To4())
+	binary.BigEndian.PutUint16(responseBuf[8:], uint16(localAddr.Port))
+	response := responseBuf[:]
 
 	errCode = h.SendData(conn.ID, response)
 	if errCode != protocol.ErrNone {
@@ -75,98 +72,81 @@ func (h *SocksHandler) handleConnect(conn *protocol.Connection, cmdData []byte) 
 		return protocol.ErrPacketSendFailed
 	}
 
-	// Store connection and set state
+	// Store connection (state is already established via ProtocolConn)
 	conn.Conn = targetConn
-	conn.State = protocol.StateConnected
 
 	// Start data transfer
 	return h.handleTCPDataTransfer(conn, targetConn)
 }
 
 // handleTCPDataTransfer manages bidirectional data transfer for TCP connections.
-// It spawns two goroutines:
-//   - One reads from client and writes to target
-//   - One reads from target and writes to client
+// Uses io.Copy for efficient data transfer: io.Copy(dst, src)
 //
 // The transfer continues until either:
 //   - The connection is closed by either end
 //   - The context is canceled
 //   - An error occurs
 func (h *SocksHandler) handleTCPDataTransfer(conn *protocol.Connection, tcpConn net.Conn) byte {
-	// Create channels for communication
-	clientToTarget := make(chan []byte)
-	targetToClient := make(chan []byte)
-	errorCh := make(chan byte, 2)
+	errCh := make(chan error, 2)
 
-	// Read from SOCKS client and forward to target
+	// Client → Target
 	go func() {
-		for {
-			select {
-			case <-conn.Closed:
-				return
-			case <-h.Ctx.Done():
-				return
-			case data, ok := <-conn.ReadBuffer:
-				if !ok {
-					return
-				}
-				clientToTarget <- data
-			}
+		_, err := io.Copy(tcpConn, conn.ProtocolConn)
+		// Half-close: close write side of target when client→target finishes
+		if tcpCloser, ok := tcpConn.(*net.TCPConn); ok {
+			tcpCloser.CloseWrite()
 		}
+		errCh <- err
 	}()
 
-	// Read from target and forward to SOCKS client
+	// Target → Client
 	go func() {
-		buffer := make([]byte, 128*1024)
-		for {
-			n, err := tcpConn.Read(buffer)
-			if err != nil {
-				if err == io.EOF {
-					errorCh <- protocol.ErrConnectionClosed
-				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					errorCh <- protocol.ErrTTLExpired
-				} else {
-					errorCh <- protocol.ErrHostUnreachable
-				}
-				return
-			}
-			// Copy data since buffer will be reused
-			data := make([]byte, n)
-			copy(data, buffer[:n])
-			targetToClient <- data
-		}
+		_, err := io.Copy(conn.ProtocolConn, tcpConn)
+		errCh <- err
 	}()
 
-	// Main data transfer loop
-	for {
+	// Wait for BOTH directions to complete (don't exit early on first error!)
+	// DO NOT listen to conn.Closed here - it will abort the wait loop prematurely!
+	var err1, err2 error
+	for i := 0; i < 2; i++ {
 		select {
-		case <-conn.Closed:
-			tcpConn.Close()
-			return protocol.ErrNone
-
 		case <-h.Ctx.Done():
 			tcpConn.Close()
+			conn.ProtocolConn.Close()
 			return protocol.ErrHandlerStopped
 
-		case errCode := <-errorCh:
+		case <-conn.Closed:
 			tcpConn.Close()
-			return errCode
-
-		case data := <-clientToTarget:
-			_, err := tcpConn.Write(data)
-			if err != nil {
-				tcpConn.Close()
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					return protocol.ErrTTLExpired
-				}
-				return protocol.ErrHostUnreachable
+			conn.ProtocolConn.Close()
+			// Drain any remaining errors
+			select {
+			case <-errCh:
+			default:
 			}
-		case data := <-targetToClient:
-			errCode := h.SendData(conn.ID, data)
-			if errCode != protocol.ErrNone {
-				tcpConn.Close()
-				return protocol.ErrPacketSendFailed
+			return protocol.ErrNone
+
+		case err := <-errCh:
+			if err1 == nil {
+				err1 = err
+			} else {
+				err2 = err
 			}
 		}
 	}
+
+	// Both directions finished - NOW it's safe to close
+	tcpConn.Close()
+	conn.ProtocolConn.Close()
+
+	// Check for errors (ignore normal EOF and closed connections)
+	for _, err := range []error{err1, err2} {
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			// Use helper to map network errors to protocol errors
+			if errCode := protocol.MapNetError(err); errCode != protocol.ErrTransportClosed {
+				return errCode
+			}
+		}
+	}
+
+	return protocol.ErrNone
 }

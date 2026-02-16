@@ -1,4 +1,4 @@
-// Package main implements the SOCKS proxy server.
+// Package main implements the SOCKS proxy server using aznet.
 package main
 
 import (
@@ -6,82 +6,88 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/desertbit/grumble"
 	"github.com/google/uuid"
 	"github.com/jedib0t/go-pretty/table"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	"proxyblob/pkg/protocol"
 	proxy "proxyblob/pkg/proxy/server"
-	"proxyblob/pkg/transport"
+
+	"github.com/atsika/aznet"
 )
 
 // CLI banner with version.
 const banner = `
-  ____                      ____  _       _     
- |  _ \ _ __ _____  ___   _| __ )| | ___ | |__  
- | |_) | '__/ _ \ \/ / | | |  _ \| |/ _ \| '_ \ 
- |  __/| | | (_) >  <| |_| | |_) | | (_) | |_) |
- |_|   |_|  \___/_/\_\\__, |____/|_|\___/|_.__/ 
-                      |___/                     
+     ____                      ____  _       _     
+    |  _ \ _ __ _____  ___   _| __ )| | ___ | |__  
+    | |_) | '__/ _ \ \/ / | | |  _ \| |/ _ \| '_ \ 
+    |  __/| | | (_) >  <| |_| | |_) | | (_) | |_) |
+    |_|   |_|  \___/_/\_\\__, |____/|_|\___/|_.__/ 
+                         |___/                     
 
-   SOCKS Proxy over Azure Blob Storage (v1.0)
-   ------------------------------------------
+  SOCKS Proxy over More Azure Storage (v2.0 - aznet)
+  --------------------------------------------------
 
 `
 
-// Blob names for proxy-agent communication.
-const (
-	InfoBlobName     = "info"     // agent metadata
-	RequestBlobName  = "request"  // proxy-to-agent traffic
-	ResponseBlobName = "response" // agent-to-proxy traffic
-)
+// ListenerConfig holds Azure Storage credentials for a single listener.
+type ListenerConfig struct {
+	Name               string `json:"name"`                // listener name/ID
+	Driver             string `json:"driver"`              // azblob, aztable, or azqueue
+	Address            string `json:"address"`             // endpoint URL (e.g. http://127.0.0.1:10001)
+	StorageAccountName string `json:"storage_account"`     // account ID
+	StorageAccountKey  string `json:"storage_account_key"` // access key
+}
 
-// InfoKey defines the XOR encryption key for agent information
-// Security Note: Changing this key requires synchronized updates on both proxy and agent
-var (
-	InfoKey = []byte{0xDE, 0xAD, 0xB1, 0x0B}
-)
-
-// Config holds Azure Storage credentials.
+// Config holds multiple listener configurations.
 type Config struct {
-	StorageAccountName string `json:"storage_account_name"`  // account ID
-	StorageAccountKey  string `json:"storage_account_key"`   // access key
-	StorageURL         string `json:"storage_url,omitempty"` // custom endpoint (for development purposes)
+	Listeners []ListenerConfig `json:"listeners"` // array of listener configurations
 }
 
-// StorageManager handles Azure Storage operations.
-type StorageManager struct {
-	ServiceURL          *azblob.ServiceURL          // storage endpoint
-	SharedKeyCredential *azblob.SharedKeyCredential // auth credentials
+// ListenerState tracks the state of a listener.
+type ListenerState struct {
+	Config     *ListenerConfig    // listener configuration
+	Listener   *aznet.Listener    // aznet listener
+	ListenAddr string             // address where listener is bound
+	Running    bool               // whether listener is running
+	StartedAt  time.Time          // when listener was started
+	CancelFunc context.CancelFunc // function to cancel the accept loop context
 }
 
-// ContainerInfo tracks proxy agent metadata.
-type ContainerInfo struct {
-	ID           string    // container ID
-	AgentInfo    string    // username@hostname
-	ProxyPort    string    // SOCKS port
-	CreatedAt    time.Time // creation time
-	LastActivity time.Time // last operation
+// AgentConnection tracks a connected agent.
+type AgentConnection struct {
+	ID         string    // connection ID
+	Conn       net.Conn  // aznet connection
+	ListenerID string    // ID of the listener this agent connected to
+	Info       string    // agent identity (user@host)
+	LastSeen   time.Time // last message received from agent
+	CreatedAt  time.Time // connection time
+}
+
+// AgentInfo tracks connected agent metadata for display.
+type AgentInfo struct {
+	*AgentConnection
+	ProxyPort string // SOCKS port (if proxy is running)
 }
 
 // Global state.
 var (
-	config         *Config         // app config
-	storageManager *StorageManager // storage access
-	selectedAgent  string          // current agent
-	runningProxies sync.Map        // active proxies
+	config           *Config      // app config
+	app              *grumble.App // grumble app instance for prompt updates
+	listeners        sync.Map     // active listeners: map[listenerID]*ListenerState
+	connectedAgents  sync.Map     // connected agents: map[connID]*AgentConnection
+	runningProxies   sync.Map     // active proxies: map[connID]*proxy.ProxyServer
+	selectedAgent    string       // currently selected agent ID
+	selectedListener string       // currently selected/default listener ID
 )
 
 // LoadConfig reads and parses config file.
@@ -108,605 +114,931 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file %s: %v", absPath, err)
 	}
 
-	config := new(Config)
-	if err := json.Unmarshal(data, config); err != nil {
+	cfg := new(Config)
+	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %v", absPath, err)
 	}
 
 	// Validate configuration
-	if err := config.Validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
-	return config, nil
+	return cfg, nil
 }
 
 // Validate checks required config fields.
-func (config *Config) Validate() error {
-	if config.StorageAccountName == "" {
-		return fmt.Errorf("storage_account_name is required")
+func (c *Config) Validate() error {
+	if len(c.Listeners) == 0 {
+		return fmt.Errorf("at least one listener configuration is required")
 	}
-	if config.StorageAccountKey == "" {
-		return fmt.Errorf("storage_account_key is required")
+
+	// Track listener names to ensure uniqueness
+	listenerNames := make(map[string]bool)
+
+	for i, listener := range c.Listeners {
+		if err := listener.Validate(); err != nil {
+			return fmt.Errorf("listener[%d]: %v", i, err)
+		}
+
+		// Check for duplicate names
+		if listenerNames[listener.Name] {
+			return fmt.Errorf("listener[%d]: duplicate listener name '%s'", i, listener.Name)
+		}
+		listenerNames[listener.Name] = true
 	}
+
 	return nil
 }
 
-// NewStorageManager creates Azure Storage client.
-func NewStorageManager(config *Config) (*StorageManager, error) {
-	// Create credentials using the storage account name and key
-	credential, err := azblob.NewSharedKeyCredential(
-		config.StorageAccountName,
-		config.StorageAccountKey,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create storage credentials: %v", err)
+// Validate checks required listener config fields.
+func (lc *ListenerConfig) Validate() error {
+	if lc.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if lc.Driver == "" {
+		return fmt.Errorf("driver is required (azblob, aztable, or azqueue)")
+	}
+	if lc.Address == "" {
+		return fmt.Errorf("address is required")
+	}
+	if lc.StorageAccountName == "" {
+		return fmt.Errorf("storage_account is required")
+	}
+	if lc.StorageAccountKey == "" {
+		return fmt.Errorf("storage_account_key is required")
 	}
 
-	// Create a pipeline for storage operations
-	pipeline := azblob.NewPipeline(
-		credential,
-		azblob.PipelineOptions{},
-	)
-
-	// Build the service URL for the storage account
-	var serviceURL *url.URL
-	if config.StorageURL != "" {
-		// Use the custom storage URL provided in the config (for Azurite support)
-		serviceURL, err = url.Parse(config.StorageURL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse storage URL: %v", err)
-		}
-		serviceURL = serviceURL.JoinPath(config.StorageAccountName)
-	} else {
-		// Use the default Azure Storage URL format
-		serviceURL, err = url.Parse(fmt.Sprintf("https://%s.blob.core.windows.net/", config.StorageAccountName))
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse service URL: %v", err)
-		}
-	}
-
-	service := azblob.NewServiceURL(*serviceURL, pipeline)
-
-	return &StorageManager{
-		ServiceURL:          &service,
-		SharedKeyCredential: credential,
-	}, nil
+	return nil
 }
 
-// CreateAgentContainer creates a new container for agent communication.
-// Returns the container ID and connection string that should be provided to the agent.
-func (sm *StorageManager) CreateAgentContainer(expiry time.Duration) (string, string, error) {
-	// Generate a unique ID for the container
-	containerID := uuid.New().String()
-	containerURL := sm.ServiceURL.NewContainerURL(containerID)
-
-	ctx := context.Background()
-
-	// Create the container with private access level
-	_, err := containerURL.Create(ctx, azblob.Metadata{}, azblob.PublicAccessNone)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create container: %v", err)
-	}
-
-	// Initialize the required blobs
-	blobNames := []string{InfoBlobName, RequestBlobName, ResponseBlobName}
-	for _, blobName := range blobNames {
-		blobURL := containerURL.NewBlockBlobURL(blobName)
-
-		// Create an empty blob - it will be populated later by the agent or proxy
-		_, err := blobURL.Upload(
-			ctx,
-			strings.NewReader(""), // Empty content initially
-			azblob.BlobHTTPHeaders{
-				ContentType: "application/octet-stream",
-			},
-			azblob.Metadata{
-				"created": time.Now().UTC().Format(time.RFC3339),
-			},
-			azblob.BlobAccessConditions{},
-			azblob.DefaultAccessTier,
-			azblob.BlobTagsMap{},               // No initial tags
-			azblob.ClientProvidedKeyOptions{},  // No client-provided encryption
-			azblob.ImmutabilityPolicyOptions{}, // No immutability policy
-		)
-
-		if err != nil {
-			// If blob creation fails, attempt to clean up the container
-			if _, delErr := containerURL.Delete(ctx, azblob.ContainerAccessConditions{}); delErr != nil {
-				return "", "", fmt.Errorf("failed to delete container after blob creation failed: %v", delErr)
-			}
-			return "", "", fmt.Errorf("failed to create %s blob: %v", blobName, err)
+// StartListener creates and starts an aznet listener for the given listener config.
+func StartListener(listenerID string) error {
+	// Check if listener already exists
+	if val, ok := listeners.Load(listenerID); ok {
+		state := val.(*ListenerState)
+		if state.Running {
+			return fmt.Errorf("listener '%s' is already running", listenerID)
 		}
 	}
 
-	// Generate a SAS token for the container
-	sasToken, err := sm.GenerateSASToken(containerID, expiry)
-	if err != nil {
-		// If SAS token generation fails, clean up the container
-		if _, delErr := containerURL.Delete(ctx, azblob.ContainerAccessConditions{}); delErr != nil {
-			return "", "", fmt.Errorf("failed to delete container after SAS token generation failed")
+	// Find the listener config
+	var listenerConfig *ListenerConfig
+	for i := range config.Listeners {
+		if config.Listeners[i].Name == listenerID {
+			listenerConfig = &config.Listeners[i]
+			break
 		}
-		return "", "", fmt.Errorf("failed to generate SAS token")
 	}
 
-	connectionString, _ := url.Parse(storageManager.ServiceURL.String())
-	connectionString = connectionString.JoinPath(containerID)
-	connString := connectionString.String() + "?" + sasToken
+	if listenerConfig == nil {
+		return fmt.Errorf("listener '%s' not found in configuration", listenerID)
+	}
 
-	return containerID, connString, nil
+	// Validate the listener config
+	if err := listenerConfig.Validate(); err != nil {
+		return fmt.Errorf("invalid listener config: %v", err)
+	}
+
+	// Build the listen address using url.URL for proper escaping
+	u, err := url.Parse(listenerConfig.Address)
+	if err != nil {
+		return fmt.Errorf("invalid address format: %v", err)
+	}
+
+	listenURL := &url.URL{
+		Scheme: u.Scheme,
+		User:   url.UserPassword(listenerConfig.StorageAccountName, listenerConfig.StorageAccountKey),
+		Host:   u.Host,
+		Path:   u.Path,
+	}
+	listenAddr := listenURL.String()
+
+	log.Debug().Str("listener_id", listenerID).Str("listen_addr", listenAddr).Msg("Starting aznet listener")
+
+	// Use ultra-aggressive polling (1ms) - this will increase Azure API costs!
+	ctx, cancel := context.WithCancel(context.Background())
+	l, err := aznet.Listen(listenerConfig.Driver, listenAddr, aznet.WithContext(ctx))
+	if err != nil {
+		cancel()
+		return fmt.Errorf("failed to start aznet listener: %v", err)
+	}
+
+	listener, ok := l.(*aznet.Listener)
+	if !ok {
+		cancel()
+		l.Close()
+		return fmt.Errorf("failed to cast to aznet.Listener")
+	}
+
+	// Store listener state
+	state := &ListenerState{
+		Config:     listenerConfig,
+		Listener:   listener,
+		ListenAddr: listenAddr,
+		Running:    true,
+		StartedAt:  time.Now(),
+		CancelFunc: cancel,
+	}
+	listeners.Store(listenerID, state)
+
+	// Set this listener as the default when started
+	selectedListener = listenerID
+
+	log.Info().Str("listener_id", listenerID).Str("driver", listenerConfig.Driver).Str("addr", listenerConfig.Address).Msg("Aznet listener started and set as default")
+
+	// Start accepting agent connections for this listener
+	go AcceptAgentLoopForListener(ctx, listenerID, listener)
+
+	return nil
 }
 
-// GenerateSASToken creates a Shared Access Signature token for container access.
-// The token provides limited-time read/write access to specific container resources.
-func (sm *StorageManager) GenerateSASToken(containerName string, expiry time.Duration) (string, error) {
-	// Start time is 5 minutes before now to avoid clock skew issues
-	startTime := time.Now().UTC().Add(-5 * time.Minute)
-
-	// Set expiry time (default 7 days)
-	expiryTime := time.Now().UTC().Add(expiry)
-
-	// Define the permissions for the SAS token
-	permissions := azblob.ContainerSASPermissions{
-		Read:  true,
-		Write: true,
+// StopListener stops an aznet listener.
+func StopListener(listenerID string) error {
+	val, ok := listeners.Load(listenerID)
+	if !ok {
+		return fmt.Errorf("listener '%s' not found", listenerID)
 	}
 
-	// Generate the SAS signature
-	sasQueryParams, err := azblob.BlobSASSignatureValues{
-		Protocol:      azblob.SASProtocolHTTPSandHTTP,
-		StartTime:     startTime,
-		ExpiryTime:    expiryTime,
-		ContainerName: containerName,
-		Permissions:   permissions.String(),
-	}.NewSASQueryParameters(sm.SharedKeyCredential)
-
-	if err != nil {
-		return "", fmt.Errorf("failed to create SAS query parameters: %v", err)
+	state := val.(*ListenerState)
+	if !state.Running {
+		return fmt.Errorf("listener '%s' is not running", listenerID)
 	}
 
-	// Convert the SAS query parameters to a string
-	sasToken := sasQueryParams.Encode()
-	return sasToken, nil
-}
-
-// ListAgentContainers retrieves information about all agent containers.
-// It fetches container metadata and agent information, sorted by creation time.
-func (sm *StorageManager) ListAgentContainers(ctx context.Context) ([]ContainerInfo, error) {
-	var containers []ContainerInfo
-
-	// List all containers in the storage account
-	for marker := (azblob.Marker{}); marker.NotDone(); {
-		// Get a segment of containers (up to 100 at a time)
-		listResponse, err := sm.ServiceURL.ListContainersSegment(ctx, marker, azblob.ListContainersSegmentOptions{
-			Prefix:     "",
-			MaxResults: 0,
-		})
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to list containers: %v", err)
+	// First, send FIN messages to all agents while listener is still open
+	// This allows agents to gracefully receive the shutdown notification
+	connectedAgents.Range(func(key, value interface{}) bool {
+		agent := value.(*AgentConnection)
+		if agent.ListenerID == listenerID {
+			// Try to send FIN message using CloseWrite if supported
+			// This allows agents to gracefully handle the shutdown
+			if closeWriter, ok := agent.Conn.(interface {
+				CloseWrite() error
+			}); ok {
+				_ = closeWriter.CloseWrite()
+			}
 		}
+		return true
+	})
 
-		// Update marker for next iteration
-		marker = listResponse.NextMarker
+	// Wait for FIN messages to be sent and propagate through Azure storage
+	// This gives agents time to receive the shutdown notification
+	time.Sleep(200 * time.Millisecond)
 
-		// Process each container
-		for _, containerItem := range listResponse.ContainerItems {
-			// Create container URL for accessing blobs
-			containerURL := sm.ServiceURL.NewContainerURL(containerItem.Name)
+	// Now cancel the accept loop context
+	if state.CancelFunc != nil {
+		state.CancelFunc()
+	}
 
-			// Try to get the info blob
-			blobURL := containerURL.NewBlockBlobURL(InfoBlobName)
-			downloadResponse, err := blobURL.Download(ctx, 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
+	// Close the listener after FIN messages have been sent
+	if state.Listener != nil {
+		state.Listener.Close()
+	}
 
-			// Skip containers that don't have our expected structure
-			if err != nil {
-				continue
-			}
+	// Update state
+	state.Running = false
+	state.Listener = nil
+	state.CancelFunc = nil
 
-			// Read the info blob content
-			bodyReader := downloadResponse.Body(azblob.RetryReaderOptions{MaxRetryRequests: 3})
-			agentInfo, err := io.ReadAll(bodyReader)
-			bodyReader.Close()
-			if err != nil {
-				log.Warn().Err(err).Str("container", containerItem.Name).Msg("Failed to read info blob")
-				continue
-			}
-			agentInfo = protocol.Xor(agentInfo, InfoKey)
+	// Clear default selection if this was the selected listener
+	if selectedListener == listenerID {
+		selectedListener = ""
+		log.Info().Msg("Default listener cleared (listener was stopped)")
+	}
 
-			// Get last activity from response blob
-			responseBlob := containerURL.NewBlockBlobURL(ResponseBlobName)
-			responseProps, err := responseBlob.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+	// Now fully close all connections and clean up
+	connectedAgents.Range(func(key, value interface{}) bool {
+		agent := value.(*AgentConnection)
+		if agent.ListenerID == listenerID {
+			agentID := key.(string)
 
-			// Get the last modified time, defaulting to container creation time if not available
-			var lastActivity time.Time
-			if err != nil {
-				lastActivity = containerItem.Properties.LastModified
-			} else {
-				lastActivity = responseProps.LastModified()
-			}
-
-			// Check if the container has an active proxy
-			var proxyPort string
-			if value, running := runningProxies.Load(containerItem.Name); running {
-				// Try to get the port from the server object
-				if server, ok := value.(*proxy.ProxyServer); ok && server.Listener != nil {
-					_, portStr, err := net.SplitHostPort(server.Listener.Addr().String())
-					if err == nil {
-						proxyPort = portStr
-					}
+			// Stop proxy if running
+			if val, ok := runningProxies.LoadAndDelete(agentID); ok {
+				if server, ok := val.(*proxy.ProxyServer); ok {
+					server.Stop()
 				}
 			}
 
-			// Add the container to our list
-			containers = append(containers, ContainerInfo{
-				ID:           containerItem.Name,
-				AgentInfo:    string(agentInfo),
-				ProxyPort:    proxyPort,
-				CreatedAt:    containerItem.Properties.LastModified,
-				LastActivity: lastActivity,
-			})
+			// Close connection (this will also send FIN if not already sent)
+			agent.Conn.Close()
+
+			// Remove from map
+			connectedAgents.Delete(key)
+
+			// Clear selected agent if it was this one
+			if selectedAgent == agentID {
+				selectedAgent = ""
+				// Update prompt to default if app is available
+				if app != nil {
+					app.SetPrompt("proxyblob » ")
+				}
+			}
+
+			log.Info().Str("agent_id", agentID).Str("listener_id", listenerID).Msg("Agent disconnected (listener stopped)")
+		}
+		return true
+	})
+
+	log.Info().Str("listener_id", listenerID).Msg("Listener stopped")
+	return nil
+}
+
+// GenerateConnectionString creates a connection string for agents using the specified listener.
+func GenerateConnectionString(listenerID string, expiry time.Duration) (string, error) {
+	val, ok := listeners.Load(listenerID)
+	if !ok {
+		return "", fmt.Errorf("listener '%s' not found", listenerID)
+	}
+
+	state := val.(*ListenerState)
+	if !state.Running || state.Listener == nil {
+		return "", fmt.Errorf("listener '%s' is not running", listenerID)
+	}
+
+	// The expiry parameter is currently ignored by the library's ConnectionString method.
+	// It uses the DefaultSASExpiry (24h) or the one set via WithSASExpiry during Listen.
+	connStr, err := state.Listener.ConnectionString()
+	if err != nil {
+		return "", err
+	}
+
+	// Prepend the driver name so the agent knows which network to use for aznet.Dial
+	// Format: driver|connection_string
+	fullConnStr := state.Config.Driver + "|" + connStr
+
+	// Base64 encode the connection string to match expected format
+	return base64.RawStdEncoding.EncodeToString([]byte(fullConnStr)), nil
+}
+
+// AcceptAgentLoopForListener accepts incoming agent connections for a specific listener and stores them.
+func AcceptAgentLoopForListener(ctx context.Context, listenerID string, listener net.Listener) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// Check if listener was stopped
+			val, ok := listeners.Load(listenerID)
+			if !ok {
+				return
+			}
+			state := val.(*ListenerState)
+			if !state.Running {
+				return
+			}
+			log.Error().Err(err).Str("listener_id", listenerID).Msg("Failed to accept connection")
+			continue
+		}
+
+		// Generate a unique ID for this agent connection
+		agentID := uuid.New().String()
+
+		// Read agent identity (user@host) with 5-second timeout
+		info := "unknown"
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 512)
+		n, err := conn.Read(buf)
+		if err == nil && n > 0 {
+			info = string(buf[:n])
+		}
+		conn.SetReadDeadline(time.Time{})
+
+		now := time.Now()
+
+		// Store the connection
+		agent := &AgentConnection{
+			ID:         agentID,
+			Conn:       conn,
+			ListenerID: listenerID,
+			Info:       info,
+			LastSeen:   now,
+			CreatedAt:  now,
+		}
+		connectedAgents.Store(agentID, agent)
+
+		log.Info().Str("agent_id", agentID).Str("info", info).Str("listener_id", listenerID).Msg("Agent connected")
+
+		// Monitor connection in background
+		go monitorAgent(ctx, agentID, conn)
+	}
+}
+
+// monitorAgent watches for agent disconnection via proxy server context.
+// Note: We don't read from the connection directly as that interferes with the transport layer.
+func monitorAgent(ctx context.Context, agentID string, conn net.Conn) {
+	// Wait for context cancellation - the proxy server will detect connection issues
+	<-ctx.Done()
+
+	// Clean up on context cancellation
+	connectedAgents.Delete(agentID)
+
+	// Stop proxy if running
+	if val, ok := runningProxies.LoadAndDelete(agentID); ok {
+		if server, ok := val.(*proxy.ProxyServer); ok {
+			server.Stop()
 		}
 	}
 
-	return containers, nil
+	conn.Close()
+	log.Info().Str("agent_id", agentID).Msg("Agent disconnected (context done)")
 }
 
-// RenderAgentTable formats container information into a human-readable table.
-// The table includes container ID, agent info, proxy port, and timing information.
-func RenderAgentTable(containers []ContainerInfo) string {
+// ListenerInfo tracks listener metadata for display.
+type ListenerInfo struct {
+	ID        string    // listener ID/name
+	Status    string    // "running" or "stopped"
+	Protocol  string    // protocol scheme
+	Address   string    // listen address
+	StartedAt time.Time // when started (if running)
+}
+
+// ListListeners returns information about all configured listeners.
+func ListListeners() []ListenerInfo {
+	var listenerInfos []ListenerInfo
+
+	// Get all configured listeners
+	for _, listenerConfig := range config.Listeners {
+		listenerID := listenerConfig.Name
+		info := ListenerInfo{
+			ID:       listenerID,
+			Status:   "stopped",
+			Protocol: "",
+			Address:  "",
+		}
+
+		// Check if listener is running
+		if val, ok := listeners.Load(listenerID); ok {
+			state := val.(*ListenerState)
+			if state.Running {
+				info.Status = "running"
+				info.StartedAt = state.StartedAt
+				info.Protocol = state.Config.Driver
+				info.Address = state.ListenAddr
+			}
+		}
+
+		// If not running, still show protocol from config
+		if info.Protocol == "" {
+			info.Protocol = listenerConfig.Driver
+		}
+
+		listenerInfos = append(listenerInfos, info)
+	}
+
+	return listenerInfos
+}
+
+// ListAgents returns information about all connected agents.
+func ListAgents() []AgentInfo {
+	var agents []AgentInfo
+
+	connectedAgents.Range(func(key, value interface{}) bool {
+		agentID := key.(string)
+		agent := value.(*AgentConnection)
+
+		var proxyPort string
+		if val, ok := runningProxies.Load(agentID); ok {
+			if server, ok := val.(*proxy.ProxyServer); ok && server.Listener != nil {
+				_, portStr, _ := net.SplitHostPort(server.Listener.Addr().String())
+				proxyPort = portStr
+			}
+		}
+
+		agents = append(agents, AgentInfo{
+			AgentConnection: agent,
+			ProxyPort:       proxyPort,
+		})
+		return true
+	})
+
+	return agents
+}
+
+// RenderListenerTable formats listener information into a human-readable table.
+func RenderListenerTable(listeners []ListenerInfo, defaultID string) string {
 	t := table.NewWriter()
 	t.SetStyle(table.StyleRounded)
 
-	// Set up headers
 	t.AppendHeader(table.Row{
-		"Container ID",
-		"Agent info",
-		"Proxy port",
-		"First seen",
-		"Last seen",
+		"Name",
+		"Status",
+		"Protocol",
+		"Started At",
 	})
 
-	// Add rows for each container
-	for _, c := range containers {
-		// Add the container information as a row
+	// ANSI color codes
+	const (
+		colorReset = "\033[0m"
+		colorRed   = "\033[31m"
+		colorGreen = "\033[32m"
+	)
+
+	for _, l := range listeners {
+		marker := ""
+		if l.ID == defaultID {
+			marker = " (default)"
+		}
+
+		startedAt := ""
+		if l.Status == "running" && !l.StartedAt.IsZero() {
+			startedAt = l.StartedAt.Format("2006-01-02 15:04:05")
+		}
+
+		// Color the status: green for running, red for stopped
+		statusColor := colorReset
+		switch l.Status {
+		case "running":
+			statusColor = colorGreen
+		case "stopped":
+			statusColor = colorRed
+		}
+		statusDisplay := statusColor + l.Status + colorReset
+
 		t.AppendRow(table.Row{
-			c.ID,
-			c.AgentInfo,
-			c.ProxyPort,
-			c.CreatedAt.Format("2006-01-02 15:04:05"),
-			c.LastActivity.Format("2006-01-02 15:04:05"),
+			l.ID + marker,
+			statusDisplay,
+			l.Protocol,
+			startedAt,
 		})
 	}
-
-	// Configure column options for better readability
-	t.SetColumnConfigs([]table.ColumnConfig{
-		{Number: 1}, // Container ID
-		{Number: 2}, // Agent Info
-		{Number: 3}, // Proxy port
-		{Number: 4}, // Created At
-		{Number: 5}, // Last Activity
-	})
 
 	return t.Render()
 }
 
-// DeleteAgentContainer removes a container and its associated blobs.
-// This terminates the connection with the remote agent.
-func (sm *StorageManager) DeleteAgentContainer(ctx context.Context, containerID string) error {
+// RenderAgentTable formats agent information into a human-readable table.
+func RenderAgentTable(agents []AgentInfo) string {
+	t := table.NewWriter()
+	t.SetStyle(table.StyleRounded)
 
-	// Stop any running proxy for this container
-	if server, running := runningProxies.Load(containerID); running {
-		if proxyServer, ok := server.(*proxy.ProxyServer); ok {
-			proxyServer.Stop()
-		}
-		runningProxies.Delete(containerID)
+	t.AppendHeader(table.Row{
+		"Agent ID",
+		"Info",
+		"Listener",
+		"Proxy Port",
+		"Connected At",
+		"Last Seen",
+	})
+
+	for _, a := range agents {
+		t.AppendRow(table.Row{
+			a.ID,
+			a.Info,
+			a.ListenerID,
+			a.ProxyPort,
+			a.CreatedAt.Format("2006-01-02 15:04:05"),
+			formatRelativeTime(a.LastSeen),
+		})
 	}
 
-	// Create URL for the container we want to delete
-	containerURL := sm.ServiceURL.NewContainerURL(containerID)
-
-	// Delete the container and all its contents
-	_, err := containerURL.Delete(ctx, azblob.ContainerAccessConditions{})
-	if err != nil {
-		return fmt.Errorf("failed to delete container")
-	}
-
-	return nil
+	return t.Render()
 }
 
-// ValidateAgent checks if an agent container exists and is properly configured.
-// Returns error if the container is missing.
-func (sm *StorageManager) ValidateAgent(ctx context.Context, containerID string) error {
-	containerURL := sm.ServiceURL.NewContainerURL(containerID)
-	blobURL := containerURL.NewBlockBlobURL(InfoBlobName)
-
-	// Try to get the info blob to verify this is a valid agent container
-	_, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
-	if err != nil {
-		if serr, ok := err.(azblob.StorageError); ok {
-			if serr.ServiceCode() == azblob.ServiceCodeContainerNotFound {
-				return fmt.Errorf("agent container %s does not exist", containerID)
-			}
-		}
-		return fmt.Errorf("invalid agent container %s: %v", containerID, err)
+// formatRelativeTime returns a human-readable relative time string.
+func formatRelativeTime(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	}
-
-	return nil
-}
-
-// GetSelectedAgentInfo retrieves the metadata for the currently selected agent.
-// Returns error if no agent is selected or the agent information is unavailable.
-func (sm *StorageManager) GetSelectedAgentInfo(ctx context.Context) (string, error) {
-	if selectedAgent == "" {
-		return "", fmt.Errorf("no agent selected. Use 'agent use <container-id>' first")
-	}
-
-	containerURL := sm.ServiceURL.NewContainerURL(selectedAgent)
-	blobURL := containerURL.NewBlockBlobURL(InfoBlobName)
-
-	// Download the info blob
-	response, err := blobURL.Download(ctx, 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
-	if err != nil {
-		return "", fmt.Errorf("failed to get agent info: %v", err)
-	}
-
-	// Read the agent info
-	agentInfo, err := io.ReadAll(response.Body(azblob.RetryReaderOptions{MaxRetryRequests: 3}))
-	if err != nil {
-		return "", fmt.Errorf("failed to read agent info: %v", err)
-	}
-	agentInfo = protocol.Xor(agentInfo, InfoKey)
-
-	return string(agentInfo), nil
 }
 
 // AddCommands registers all CLI commands with the application.
-// This includes commands for agent management, proxy control, and configuration.
 func AddCommands(app *grumble.App) {
-	// Command to create a new agent
-	app.AddCommand(&grumble.Command{
-		Name:    "create",
-		Aliases: []string{"new"},
-		Help:    "create a new agent container and generate its connection string",
-		Flags: func(f *grumble.Flags) {
-			f.Duration("d", "duration", 7*24*time.Hour, "duration for the SAS token. by default the token will be valid for 7 days")
-		},
-		Run: func(c *grumble.Context) error {
-			expiry := c.Flags.Duration("duration")
-			containerID, connString, err := storageManager.CreateAgentContainer(expiry)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to create agent container")
-				return nil
-			}
-			log.Info().Str("container_id", containerID).Msg("Agent container created successfully")
-			log.Info().Str("connection_string", base64.RawStdEncoding.EncodeToString([]byte(connString))).Msg("Connection string generated")
-			return nil
-		},
-	})
-	// Command to list existing agents
-	app.AddCommand(&grumble.Command{
+	// Parent command for listener management
+	listenerCmd := &grumble.Command{
+		Name:    "listener",
+		Help:    "manage listeners",
+	}
+
+	// Subcommand: listener list
+	listenerCmd.AddCommand(&grumble.Command{
 		Name:    "list",
 		Aliases: []string{"ls"},
-		Help:    "list all existing agent containers",
+		Help:    "list all listeners",
 		Run: func(c *grumble.Context) error {
-			ctx := context.Background()
-
-			// Retrieve all containers
-			containers, err := storageManager.ListAgentContainers(ctx)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to list containers")
+			listenerInfos := ListListeners()
+			if len(listenerInfos) == 0 {
+				log.Info().Msg("No listeners configured")
 				return nil
 			}
 
-			// Display message if no containers found
-			if len(containers) == 0 {
-				log.Info().Msg("No agent containers found")
-				return nil
-			}
-
-			// Display the container table
-			c.App.Println(RenderAgentTable(containers))
+			c.App.Println(RenderListenerTable(listenerInfos, selectedListener))
 			return nil
 		},
 	})
-	// Command to delete an agent
-	app.AddCommand(&grumble.Command{
-		Name:    "delete",
-		Aliases: []string{"rm"},
-		Help:    "delete an existing agent container",
+
+	// Subcommand: listener start
+	listenerCmd.AddCommand(&grumble.Command{
+		Name: "start",
+		Help: "start a listener",
 		Args: func(a *grumble.Args) {
-			a.StringList("containers-id", "ID of the containers to delete")
+			a.StringList("listener-id", "ID of the listener to start")
 		},
-		Completer: CompleteAgents,
+		Completer: CompleteListeners,
 		Run: func(c *grumble.Context) error {
-			containerIDs := c.Args.StringList("containers-id")
-			if len(containerIDs) == 0 {
-				containerIDs = append(containerIDs, selectedAgent)
+			listenerIDs := c.Args.StringList("listener-id")
+			listenerID := ""
+			if len(listenerIDs) != 0 {
+				listenerID = listenerIDs[0]
+			} else {
+				listenerID = selectedListener
 			}
-
-			for _, containerID := range containerIDs {
-				// Ask for confirmation before deletion
-				log.Info().Str("container_id", containerID).Msg("Are you sure you want to delete container? [y/N]")
-				var response string
-				fmt.Scanln(&response)
-
-				if strings.ToLower(response) != "y" {
-					log.Info().Msg("Deletion cancelled")
-					return nil
-				}
-
-				// Proceed with deletion
-				ctx := context.Background()
-				if err := storageManager.DeleteAgentContainer(ctx, containerID); err != nil {
-					log.Error().Err(err).Str("container_id", containerID).Msg("Failed to delete container")
-					return nil
-				}
-
-				if selectedAgent == containerID {
-					selectedAgent = ""
-					c.App.SetPrompt("proxyblob » ")
-				}
-
-				log.Info().Str("container_id", containerID).Msg("Container deleted successfully")
+			if listenerID == "" {
+				log.Error().Msg("No listener specified and no default listener selected. Use 'listener select <id>' first or specify a listener ID")
+				return nil
+			}
+			if err := StartListener(listenerID); err != nil {
+				log.Error().Err(err).Str("listener_id", listenerID).Msg("Failed to start listener")
+				return nil
 			}
 			return nil
 		},
 	})
-	// Command to select an agent
+
+	// Subcommand: listener stop
+	listenerCmd.AddCommand(&grumble.Command{
+		Name: "stop",
+		Help: "stop a listener",
+		Args: func(a *grumble.Args) {
+			a.StringList("listener-id", "ID of the listener to stop")
+		},
+		Completer: CompleteListeners,
+		Run: func(c *grumble.Context) error {
+			listenerIDs := c.Args.StringList("listener-id")
+			listenerID := ""
+			if len(listenerIDs) != 0 {
+				listenerID = listenerIDs[0]
+			} else {
+				listenerID = selectedListener
+			}
+			if listenerID == "" {
+				log.Error().Msg("No listener specified and no default listener selected. Use 'listener select <id>' first or specify a listener ID")
+				return nil
+			}
+			if err := StopListener(listenerID); err != nil {
+				log.Error().Err(err).Str("listener_id", listenerID).Msg("Failed to stop listener")
+				return nil
+			}
+			return nil
+		},
+	})
+
+	// Subcommand: listener select
+	listenerCmd.AddCommand(&grumble.Command{
+		Name:    "select",
+		Aliases: []string{"use"},
+		Help:    "select a default listener",
+		Args: func(a *grumble.Args) {
+			a.String("listener-id", "ID of the listener to select as default")
+		},
+		Completer: CompleteListeners,
+		Run: func(c *grumble.Context) error {
+			listenerID := c.Args.String("listener-id")
+
+			// Verify listener exists in config
+			found := false
+			for _, lc := range config.Listeners {
+				if lc.Name == listenerID {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				log.Error().Str("listener_id", listenerID).Msg("Listener not found")
+				return nil
+			}
+
+			selectedListener = listenerID
+			log.Info().Str("listener_id", listenerID).Msg("Listener selected as default")
+			return nil
+		},
+	})
+
+	// Default action for listener command (list)
+	listenerCmd.Run = func(c *grumble.Context) error {
+		listenerInfos := ListListeners()
+		if len(listenerInfos) == 0 {
+			log.Info().Msg("No listeners configured")
+			return nil
+		}
+
+		c.App.Println("Listeners:")
+		c.App.Println(RenderListenerTable(listenerInfos, selectedListener))
+		return nil
+	}
+
+	app.AddCommand(listenerCmd)
+
+	// Command to create a new agent connection string
 	app.AddCommand(&grumble.Command{
+		Name:    "new",
+		Help:    "generate a new connection string for an agent",
+		Flags: func(f *grumble.Flags) {
+			f.Duration("d", "duration", 7*24*time.Hour, "duration for the SAS token (default 7 days)")
+			f.String("l", "listener", "", "listener ID to use (defaults to selected listener)")
+		},
+		Run: func(c *grumble.Context) error {
+			listenerID := c.Flags.String("listener")
+			if listenerID == "" {
+				listenerID = selectedListener
+			}
+
+			if listenerID == "" {
+				log.Error().Msg("No listener specified and no default listener selected. Use 'listener start <id>' to start a listener (it becomes the default), or use 'listener select <id>' to select a default, or use --listener flag to specify a listener")
+				return nil
+			}
+
+			// Check if listener is running
+			val, ok := listeners.Load(listenerID)
+			if !ok {
+				log.Error().Str("listener_id", listenerID).Msg("Listener not found or not started")
+				return nil
+			}
+
+			state := val.(*ListenerState)
+			if !state.Running {
+				log.Error().Str("listener_id", listenerID).Msg("Listener is not running")
+				return nil
+			}
+
+			expiry := c.Flags.Duration("duration")
+			connString, err := GenerateConnectionString(listenerID, expiry)
+			if err != nil {
+				log.Error().Err(err).Str("listener_id", listenerID).Msg("Failed to generate connection string")
+				return nil
+			}
+
+			log.Info().Str("listener_id", listenerID).Str("connection_string", connString).Msg("Connection string generated")
+			return nil
+		},
+	})
+
+	// Parent command for agent management
+	agentCmd := &grumble.Command{
+		Name:    "agent",
+		Help:    "manage agents",
+	}
+
+	// Subcommand: agent list
+	agentCmd.AddCommand(&grumble.Command{
+		Name:    "list",
+		Aliases: []string{"ls"},
+		Help:    "list all connected agents",
+		Run: func(c *grumble.Context) error {
+			agents := ListAgents()
+			if len(agents) == 0 {
+				log.Info().Msg("No agents connected")
+				return nil
+			}
+
+			c.App.Println("Agents:")
+			c.App.Println(RenderAgentTable(agents))
+			return nil
+		},
+	})
+
+	// Subcommand: agent select
+	agentCmd.AddCommand(&grumble.Command{
 		Name:    "select",
 		Aliases: []string{"use"},
 		Help:    "select an agent for subsequent commands",
 		Args: func(a *grumble.Args) {
-			a.String("container-id", "ID of the container to select")
+			a.String("agent-id", "ID of the agent to select")
 		},
 		Completer: CompleteAgents,
 		Run: func(c *grumble.Context) error {
-			ctx := context.Background()
-			containerID := c.Args.String("container-id")
+			agentID := c.Args.String("agent-id")
 
-			// Validate the agent exists
-			if err := storageManager.ValidateAgent(ctx, containerID); err != nil {
-				log.Error().Err(err).Msg("Failed to validate agent")
+			// Verify agent exists
+			if _, ok := connectedAgents.Load(agentID); !ok {
+				log.Error().Str("agent_id", agentID).Msg("Agent not found")
 				return nil
 			}
 
-			// Store the selected agent
-			selectedAgent = containerID
-
-			// Get and display agent info
-			agentInfo, err := storageManager.GetSelectedAgentInfo(ctx)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to get agent info")
-				return nil
-			}
-			if agentInfo == "" {
-				agentInfo = "unknown@host"
-			}
-
-			log.Info().Str("agent", agentInfo).Msg("Agent selected")
-			c.App.SetPrompt(agentInfo + " » ")
+			selectedAgent = agentID
+			log.Info().Str("agent_id", agentID).Msg("Agent selected")
+			c.App.SetPrompt(agentID[:8] + " » ")
 
 			return nil
 		},
 	})
-	// Command to start the proxy server over the current selected agent
-	app.AddCommand(&grumble.Command{
+
+	// Subcommand: agent start
+	agentCmd.AddCommand(&grumble.Command{
 		Name:    "start",
-		Aliases: []string{"proxy"},
-		Help:    "start SOCKS proxy server",
+		Help:    "start SOCKS proxy for the selected agent",
 		Flags: func(f *grumble.Flags) {
 			f.String("l", "listen", "127.0.0.1:1080", "listen address for SOCKS server")
 		},
 		Run: func(c *grumble.Context) error {
 			if selectedAgent == "" {
-				log.Warn().Msg("No agent selected. Use 'select <container-id>' first")
+				log.Warn().Msg("No agent selected. Use 'agent select <agent-id>' first")
 				return nil
 			}
 
+			// Check if proxy already running
 			if _, exists := runningProxies.Load(selectedAgent); exists {
 				log.Warn().Msg("Proxy already running for this agent")
 				return nil
 			}
 
-			// Verify the container still exists before starting a proxy
-			ctx := context.Background()
-
-			// Check if the container exists
-			if err := storageManager.ValidateAgent(ctx, selectedAgent); err != nil {
-				log.Error().Err(err).Msg("Cannot start proxy")
+			// Get the agent connection
+			val, ok := connectedAgents.Load(selectedAgent)
+			if !ok {
+				log.Error().Msg("Selected agent no longer connected")
+				selectedAgent = ""
+				c.App.SetPrompt("proxyblob » ")
 				return nil
 			}
 
-			containerURL := storageManager.ServiceURL.NewContainerURL(selectedAgent)
-			transport := transport.NewBlobTransport(
-				containerURL.NewBlockBlobURL(ResponseBlobName),
-				containerURL.NewBlockBlobURL(RequestBlobName),
-			)
+			agent := val.(*AgentConnection)
+			ctx := context.Background()
 
-			server := proxy.NewProxyServer(ctx, transport)
-			listenAddr := c.Flags.String("listen")
+			// Create a proxy server for this agent (direct connection, no transport wrapper)
+			proxyServer := proxy.NewProxyServer(ctx, agent.Conn)
 
-			runningProxies.Store(selectedAgent, server)
-			server.Start(listenAddr)
-
-			// Log the port info for user feedback
-			if server.Listener != nil {
-				_, portStr, _ := net.SplitHostPort(server.Listener.Addr().String())
-				// Get agent info for notification
-				agentInfo, err := storageManager.GetSelectedAgentInfo(context.Background())
-				if err != nil || agentInfo == "" {
-					agentInfo = selectedAgent // Fallback to container ID if we can't get agent info
-				}
-
-				log.Info().Str("agent", agentInfo).Str("port", portStr).Msg("Proxy started successfully")
+			// Set callback to update LastSeen on every received packet
+			proxyServer.OnReceive = func() {
+				agent.LastSeen = time.Now()
 			}
+
+			listenAddr := c.Flags.String("listen")
+			host, port, err := net.SplitHostPort(listenAddr)
+			if err != nil {
+				log.Error().Err(err).Str("listen", listenAddr).Msg("Failed to parse listen address")
+				return nil
+			}
+			oldPort := port
+
+			portInt, _ := strconv.Atoi(port)
+			for {
+				portAvailable := true
+				runningProxies.Range(func(key, value interface{}) bool {
+					server := value.(*proxy.ProxyServer)
+					if server.Listener != nil {
+						_, serverPort, _ := net.SplitHostPort(server.Listener.Addr().String())
+						if serverPort == port {
+							portAvailable = false
+							return false
+						}
+					}
+					return true
+				})
+				if portAvailable {
+					break
+				}
+				portInt++
+				port = strconv.Itoa(portInt)
+			}
+
+			if oldPort != port {
+				log.Warn().Str("used_port", oldPort).Str("selected_port", port).Msg("Proxy already running on this port")
+			}
+
+			listenAddr = fmt.Sprintf("%s:%s", host, port)
+			proxyServer.Start(listenAddr)
+
+			if proxyServer.Listener == nil {
+				log.Error().Str("addr", listenAddr).Msg("Failed to start proxy")
+				return nil
+			}
+
+			runningProxies.Store(selectedAgent, proxyServer)
+
+			_, portStr, _ := net.SplitHostPort(proxyServer.Listener.Addr().String())
+			log.Info().Str("agent_id", selectedAgent).Str("port", portStr).Msg("Proxy started")
 
 			return nil
 		},
 	})
-	// Command to stop the proxy server running the current selected agent
-	app.AddCommand(&grumble.Command{
+
+	// Subcommand: agent stop
+	agentCmd.AddCommand(&grumble.Command{
 		Name: "stop",
-		Help: "stop running proxy for the selected agent",
+		Help: "stop the proxy for the selected agent",
 		Run: func(c *grumble.Context) error {
 			if selectedAgent == "" {
-				log.Warn().Msg("No agent selected. Use 'select <container-id>' first")
+				log.Warn().Msg("No agent selected. Use 'agent select <agent-id>' first")
 				return nil
 			}
 
-			// Retrieve and remove the value from the map in one atomic operation
-			value, exists := runningProxies.LoadAndDelete(selectedAgent)
+			// Get and remove the proxy
+			val, exists := runningProxies.LoadAndDelete(selectedAgent)
 			if !exists {
 				log.Warn().Msg("No proxy running for this agent")
 				return nil
 			}
 
-			// Try to stop the proxy gracefully
-			server, _ := value.(*proxy.ProxyServer)
+			// Stop the proxy
+			server := val.(*proxy.ProxyServer)
 			server.Stop()
 
-			// Get agent info for notification
-			agentInfo, err := storageManager.GetSelectedAgentInfo(context.Background())
-			if err != nil || agentInfo == "" {
-				agentInfo = selectedAgent // Fallback to container ID if we can't get agent info
-			}
-
-			log.Info().Str("agent", agentInfo).Msg("Proxy stopped")
+			log.Info().Str("agent_id", selectedAgent).Msg("Proxy stopped")
 
 			return nil
 		},
 	})
+
+	// Subcommand: agent remove
+	agentCmd.AddCommand(&grumble.Command{
+		Name:    "remove",
+		Aliases: []string{"rm"},
+		Help:    "remove an agent (disconnect and stop proxy)",
+		Args: func(a *grumble.Args) {
+			a.String("agent-id", "ID of the agent to disconnect", grumble.Default(selectedAgent))
+		},
+		Completer: CompleteAgents,
+		Run: func(c *grumble.Context) error {
+			agentID := c.Args.String("agent-id")
+			if agentID == "" {
+				agentID = selectedAgent
+			}
+
+			// Get the agent
+			val, ok := connectedAgents.LoadAndDelete(agentID)
+			if !ok {
+				log.Error().Str("agent_id", agentID).Msg("Agent not found")
+				return nil
+			}
+
+			agent := val.(*AgentConnection)
+
+			// Stop proxy if running
+			if val, ok := runningProxies.LoadAndDelete(agentID); ok {
+				if server, ok := val.(*proxy.ProxyServer); ok {
+					server.Stop()
+				}
+			}
+
+			// Close the connection
+			agent.Conn.Close()
+
+			if selectedAgent == agentID {
+				selectedAgent = ""
+				c.App.SetPrompt("proxyblob » ")
+			}
+
+			log.Info().Str("agent_id", agentID).Msg("Agent disconnected")
+
+			return nil
+		},
+	})
+
+	// Default action for agent command (list)
+	agentCmd.Run = func(c *grumble.Context) error {
+		agents := ListAgents()
+		if len(agents) == 0 {
+			log.Info().Msg("No agents connected")
+			return nil
+		}
+
+		c.App.Println(RenderAgentTable(agents))
+		return nil
+	}
+
+	app.AddCommand(agentCmd)
 }
 
 // CompleteAgents provides tab completion for agent IDs.
-// Returns a list of available agent container IDs.
 func CompleteAgents(_ string, _ []string) []string {
-	containers, err := storageManager.ListAgentContainers(context.Background())
-	if err != nil {
-		return []string{} // Return empty slice on error
-	}
-
 	var completions []string
-	for _, container := range containers {
-		completions = append(completions, container.ID)
+	connectedAgents.Range(func(key, _ interface{}) bool {
+		completions = append(completions, key.(string))
+		return true
+	})
+	return completions
+}
+
+// CompleteListeners provides tab completion for listener IDs.
+func CompleteListeners(_ string, _ []string) []string {
+	var completions []string
+	for _, listenerConfig := range config.Listeners {
+		completions = append(completions, listenerConfig.Name)
 	}
 	return completions
 }
 
-// -----------------------------------------------------------------------------
-// Main Application Entry
-// -----------------------------------------------------------------------------
-
 // main is the entry point for the application.
-// It sets up the CLI, configuration, and command handlers.
 func main() {
 	// Set up logging
 	configureLogging()
 
 	// Configure and create the CLI app
-	app := setupCLI()
+	app = setupCLI()
 
 	// Add all command handlers
 	AddCommands(app)
@@ -719,26 +1051,23 @@ func main() {
 
 // configureLogging sets up zerolog with appropriate formatting and level.
 func configureLogging() {
-	// Configure zerolog with a pretty console writer for interactive use
 	log.Logger = log.Output(zerolog.ConsoleWriter{
 		Out:        os.Stdout,
 		TimeFormat: "15:04:05",
 	})
 
-	// Set reasonable default log level
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 }
 
 // setupCLI initializes the command-line interface with basic configuration.
-// Returns a configured grumble App instance.
 func setupCLI() *grumble.App {
 	// Determine history file location
 	var histFile string
 	home, err := os.UserHomeDir()
 	if err != nil {
-		histFile = ".proxyblob" // current working directory
+		histFile = ".proxyblob"
 	} else {
-		histFile = filepath.Join(home, ".proxyblob") // home directory
+		histFile = filepath.Join(home, ".proxyblob")
 	}
 
 	// Create and configure the CLI app
@@ -750,30 +1079,23 @@ func setupCLI() *grumble.App {
 		},
 	})
 
-	// Set up our ASCII art banner
+	// Set up banner
 	app.SetPrintASCIILogo(func(a *grumble.App) {
 		fmt.Print(banner)
 	})
 
 	// Initialize configuration when the app starts
 	app.OnInit(func(a *grumble.App, flags grumble.FlagMap) error {
-		// Load configuration from file
+		// Load configuration
 		var err error
 		config, err = LoadConfig(flags.String("config"))
 		if err != nil {
 			return fmt.Errorf("failed to load configuration: %v", err)
 		}
 
-		// Validate the configuration
-		if err := config.Validate(); err != nil {
-			return fmt.Errorf("invalid configuration: %v", err)
-		}
-
-		// Initialize the storage manager
-		storageManager, err = NewStorageManager(config)
-		if err != nil {
-			return fmt.Errorf("failed to initialize storage manager: %v", err)
-		}
+		// Note: Listeners are not auto-started. User must start them explicitly.
+		// When a listener is started, it automatically becomes the default.
+		log.Info().Int("listener_count", len(config.Listeners)).Msg("Configuration loaded. Use 'listener start <id>' to start a listener (it will become the default).")
 
 		return nil
 	})

@@ -31,17 +31,8 @@ func (h *SocksHandler) handleUDPAssociate(conn *protocol.Connection) byte {
 
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		// Determine specific error type
-		errCode := protocol.ErrGeneralSocksFailure
-		if opErr, ok := err.(*net.OpError); ok {
-			if errors.Is(opErr, net.ErrClosed) {
-				errCode = protocol.ErrTransportClosed
-			} else if opErr.Op == "listen" {
-				errCode = protocol.ErrNetworkUnreachable
-			}
-		}
-
-		// Send appropriate error response
+		// Map network error to appropriate protocol error code
+		errCode := protocol.MapNetError(err)
 		h.SendError(conn, errCode)
 		return errCode
 	}
@@ -68,9 +59,8 @@ func (h *SocksHandler) handleUDPAssociate(conn *protocol.Connection) byte {
 		return protocol.ErrPacketSendFailed
 	}
 
-	// Store UDP connection and start handling packets
+	// Store UDP connection and start handling packets (state is already established via ProtocolConn)
 	conn.Conn = udpConn
-	conn.State = protocol.StateConnected
 
 	go h.handleUDPPackets(conn)
 
@@ -98,7 +88,7 @@ func (h *SocksHandler) handleUDPAssociate(conn *protocol.Connection) byte {
 // the context is canceled.
 func (h *SocksHandler) handleUDPPackets(conn *protocol.Connection) {
 	udpConn := conn.Conn.(*net.UDPConn)
-	buffer := make([]byte, 64*1024)
+	buffer := make([]byte, 16*1024) // Reduced from 64KB to 16KB
 	var clientAddr *net.UDPAddr
 
 	// Create a UDP connection for sending to targets
@@ -126,7 +116,7 @@ func (h *SocksHandler) handleUDPPackets(conn *protocol.Connection) {
 
 	// Start a goroutine to handle responses
 	go func() {
-		respBuf := make([]byte, 128*1024)
+		respBuf := make([]byte, 16*1024) // Reduced from 128KB to 16KB
 		for {
 			// Check for cancellation
 			select {
@@ -138,8 +128,8 @@ func (h *SocksHandler) handleUDPPackets(conn *protocol.Connection) {
 				// Continue processing
 			}
 
-			// Set read deadline
-			if err := targetConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			// Set read deadline to 100ms for faster response (reduced from 300ms)
+			if err := targetConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 				if errors.Is(err, net.ErrClosed) {
 					return
 				}
@@ -252,8 +242,8 @@ func (h *SocksHandler) handleUDPPackets(conn *protocol.Connection) {
 			}
 
 		default:
-			// Set read deadline to prevent blocking forever
-			if err := udpConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			// Set read deadline to 100ms for faster response (reduced from 300ms)
+			if err := udpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 				if errors.Is(err, net.ErrClosed) {
 					return
 				}

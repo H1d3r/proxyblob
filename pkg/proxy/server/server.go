@@ -1,7 +1,7 @@
 // Package proxy implements a SOCKS proxy server.
 // It accepts client connections and forwards traffic through transport channels
-// to remote agents. The server manages connection lifecycle, encryption, and
-// bidirectional data transfer.
+// to remote agents. The server manages connection lifecycle and bidirectional
+// data transfer.
 package proxy
 
 import (
@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"proxyblob/pkg/protocol"
-	"proxyblob/pkg/transport"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,11 +27,11 @@ type ProxyServer struct {
 	Listener net.Listener
 }
 
-// NewProxyServer creates a proxy server instance with the given transport.
-// The transport is used for communication with remote agents.
-func NewProxyServer(ctx context.Context, transport transport.Transport) *ProxyServer {
+// NewProxyServer creates a proxy server instance with the given connection.
+// The connection is used for communication with remote agents.
+func NewProxyServer(ctx context.Context, conn net.Conn) *ProxyServer {
 	server := &ProxyServer{}
-	server.BaseHandler = protocol.NewBaseHandler(ctx, transport)
+	server.BaseHandler = protocol.NewBaseHandler(ctx, conn)
 	server.PacketHandler = server
 	return server
 }
@@ -69,8 +68,7 @@ func (s *ProxyServer) OnNew(connectionID uuid.UUID, data []byte) byte {
 	return protocol.ErrUnexpectedPacket
 }
 
-// OnAck processes connection acknowledgments from agents. It derives a shared
-// encryption key using the agent's public key and updates the connection state.
+// OnAck processes connection acknowledgments from agents.
 // Returns an error code indicating success or failure.
 func (s *ProxyServer) OnAck(connectionID uuid.UUID, data []byte) byte {
 	value, ok := s.Connections.Load(connectionID)
@@ -79,34 +77,20 @@ func (s *ProxyServer) OnAck(connectionID uuid.UUID, data []byte) byte {
 	}
 	conn := value.(*protocol.Connection)
 
-	if conn.State != protocol.StateNew {
+	// Check if connection already established (ProtocolConn should be nil for new connections)
+	if conn.ProtocolConn != nil {
 		return protocol.ErrInvalidState
 	}
 
-	clientPublicKey := data[:32]
-
-	// At this point,conn.SecretKey contains [24B nonce][32B server private key]
-	nonce := conn.SecretKey[:24]
-	serverPrivateKey := conn.SecretKey[24:]
-
-	// Derive the shared key
-	symmetricKey, errCode := protocol.DeriveKey(serverPrivateKey, clientPublicKey, nonce)
-	if errCode != protocol.ErrNone {
-		return errCode
-	}
-
-	// Store the symmetric key
-	conn.SecretKey = symmetricKey
-
-	// Signal connection acknowledgment (non-blocking)
-	conn.ReadBuffer <- []byte{}
-	conn.State = protocol.StateConnected
+	// Create the virtual protocol connection (marks connection as established)
+	conn.ProtocolConn = protocol.NewProtocolConn(s.Ctx, connectionID, s.BaseHandler)
+	conn.StartDelivery()
 	conn.LastActivity = time.Now()
 	return protocol.ErrNone
 }
 
-// OnData processes data received from agents. It decrypts the data and forwards
-// it to the client. Returns an error code indicating success or failure.
+// OnData processes data received from agents and forwards it to the client.
+// Returns an error code indicating success or failure.
 func (s *ProxyServer) OnData(connectionID uuid.UUID, data []byte) byte {
 	value, ok := s.Connections.Load(connectionID)
 	if !ok {
@@ -115,20 +99,13 @@ func (s *ProxyServer) OnData(connectionID uuid.UUID, data []byte) byte {
 	conn := value.(*protocol.Connection)
 	conn.LastActivity = time.Now()
 
-	decrypted, errCode := protocol.Decrypt(conn.SecretKey, data)
-	if errCode != protocol.ErrNone {
-		return errCode
+	// Non-blocking delivery to per-connection goroutine
+	if conn.ProtocolConn != nil {
+		if !conn.Deliver(data) {
+			return protocol.ErrBufferFull
+		}
 	}
-	data = decrypted
-
-	// Writing to client is handled by forwardToClient goroutine
-	select {
-	case <-s.Ctx.Done():
-		return protocol.ErrConnectionClosed
-	case conn.ReadBuffer <- data:
-		return protocol.ErrNone
-
-	}
+	return protocol.ErrNone
 }
 
 // OnClose handles connection termination from agents. It cleans up the
@@ -141,7 +118,18 @@ func (s *ProxyServer) OnClose(connectionID uuid.UUID, errorCode byte) byte {
 	conn := value.(*protocol.Connection)
 	conn.Close()
 	s.Connections.Delete(connectionID)
-	return errorCode
+	return protocol.ErrNone
+}
+
+// cleanupConnection closes all connection resources and removes from connection map.
+// This helper reduces code duplication in handleConnection.
+func (s *ProxyServer) cleanupConnection(connID uuid.UUID, clientConn net.Conn, proxyConn *protocol.Connection) {
+	clientConn.Close()
+	if proxyConn.ProtocolConn != nil {
+		proxyConn.ProtocolConn.Close()
+	}
+	proxyConn.Close()
+	s.Connections.Delete(connID)
 }
 
 // acceptLoop accepts incoming TCP connections and spawns goroutines to handle
@@ -178,6 +166,11 @@ func (s *ProxyServer) acceptLoop() {
 func (s *ProxyServer) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
+	// Enable TCP_NODELAY to disable Nagle's algorithm for better TLS performance
+	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
 	connID := uuid.New()
 	proxyConn := protocol.NewConnection(connID)
 	s.Connections.Store(proxyConn.ID, proxyConn)
@@ -189,114 +182,71 @@ func (s *ProxyServer) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	// 2. Wait for agent acknowledgment with timeout
-	select {
-	case <-s.Ctx.Done():
-		s.SendClose(connID, protocol.ErrHandlerStopped)
-		s.Connections.Delete(connID)
-		return
-	case <-time.After(5 * time.Second):
-		s.SendClose(connID, protocol.ErrTransportTimeout)
-		s.Connections.Delete(connID)
-		return
-	case <-proxyConn.ReadBuffer:
-		// Agent acknowledged connection
-	}
-
-	// 3. Connection established, start bidirectional forwarding
-	proxyConn.State = protocol.StateConnected
-	proxyConn.LastActivity = time.Now()
-
-	errCh := make(chan byte, 2)
-	go s.forwardToAgent(clientConn, proxyConn, errCh)
-	go s.forwardToClient(clientConn, proxyConn, errCh)
-
-	// Wait for error, closed connection, or context cancellation
-	select {
-	case <-s.Ctx.Done():
-		// Context cancelled, closing connection
-	case <-proxyConn.Closed:
-		// Connection closed by agent
-	case errCode := <-errCh:
-		if errCode != protocol.ErrNone && errCode != protocol.ErrConnectionClosed {
-			log.Error().Str("msg", ErrToString[errCode]).Msg("Connection error")
-		}
-	}
-
-	// Clean up the connection
-	s.SendClose(connID, protocol.ErrConnectionClosed)
-	proxyConn.Close()
-	s.Connections.Delete(connID)
-}
-
-// forwardToAgent reads data from the client connection and forwards it to
-// the remote agent. It continues until an error occurs or the connection
-// is closed.
-func (s *ProxyServer) forwardToAgent(clientConn net.Conn, proxyConn *protocol.Connection, errCh chan<- byte) {
-	buffer := make([]byte, 64*1024)
+	// 2. Wait for agent acknowledgment with timeout (ProtocolConn will be created in OnAck)
+	timeout := time.After(5 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
-		// Check early termination conditions
-		if proxyConn.State == protocol.StateClosed {
-			return
-		}
-
 		select {
 		case <-s.Ctx.Done():
+			s.SendClose(connID, protocol.ErrHandlerStopped)
+			s.Connections.Delete(connID)
+			return
+		case <-timeout:
+			s.SendClose(connID, protocol.ErrTransportTimeout)
+			s.Connections.Delete(connID)
+			return
+		case <-ticker.C:
+			if proxyConn.ProtocolConn != nil {
+				// Agent acknowledged connection
+				goto connected
+			}
+		}
+	}
+
+connected:
+	// 3. Connection established, start bidirectional forwarding using io.Copy
+	errCh := make(chan error, 2)
+
+	// Client → Agent
+	go func() {
+		_, err := io.Copy(proxyConn.ProtocolConn, clientConn)
+		errCh <- err
+	}()
+
+	// Agent → Client
+	go func() {
+		_, err := io.Copy(clientConn, proxyConn.ProtocolConn)
+		errCh <- err
+	}()
+
+	// Wait for BOTH directions to complete before cleaning up
+	var err1, err2 error
+	for i := 0; i < 2; i++ {
+		select {
+		case <-s.Ctx.Done():
+			s.cleanupConnection(connID, clientConn, proxyConn)
 			return
 		case <-proxyConn.Closed:
+			s.cleanupConnection(connID, clientConn, proxyConn)
 			return
-		default:
-			// Continue processing
-		}
-
-		n, err := clientConn.Read(buffer)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				errCh <- protocol.ErrConnectionClosed
-			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				errCh <- protocol.ErrTransportTimeout
+		case err := <-errCh:
+			if err1 == nil {
+				err1 = err
 			} else {
-				// General network error
-				errCh <- protocol.ErrNetworkUnreachable
+				err2 = err
 			}
-			return
 		}
-
-		errCode := s.SendData(proxyConn.ID, buffer[:n])
-		if errCode != protocol.ErrNone {
-			errCh <- protocol.ErrPacketSendFailed
-			return
-		}
-
-		proxyConn.LastActivity = time.Now()
 	}
-}
 
-// forwardToClient reads data from the connection's read buffer and forwards
-// it to the client. It continues until an error occurs or the connection
-// is closed.
-func (s *ProxyServer) forwardToClient(clientConn net.Conn, proxyConn *protocol.Connection, errCh chan<- byte) {
-	for {
-		select {
-		case <-s.Ctx.Done():
-			return
-		case <-proxyConn.Closed:
-			return
-		case data := <-proxyConn.ReadBuffer:
-			proxyConn.LastActivity = time.Now()
-			_, err := clientConn.Write(data)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					errCh <- protocol.ErrConnectionClosed
-				} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					errCh <- protocol.ErrTransportTimeout
-				} else {
-					// General network error
-					errCh <- protocol.ErrNetworkUnreachable
-				}
-				return
-			}
+	// Both directions finished - NOW clean up
+	s.cleanupConnection(connID, clientConn, proxyConn)
+
+	// Log errors if any
+	for _, err := range []error{err1, err2} {
+		if err != nil && !errors.Is(err, io.EOF) {
+			log.Debug().Err(err).Str("conn_id", connID.String()).Msg("Connection closed with error")
 		}
 	}
 }
