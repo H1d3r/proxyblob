@@ -112,3 +112,35 @@ func Decode(data []byte) *Packet {
 
 	return NewPacket(command, id, packetData)
 }
+
+// DecodeNext parses the first packet from a buffer that may contain multiple
+// concatenated packets (from write coalescing). Returns the decoded packet and
+// the remaining unconsumed bytes. Returns nil packet if data is incomplete or invalid.
+func DecodeNext(data []byte) (*Packet, []byte) {
+	if len(data) < HeaderSize {
+		return nil, data
+	}
+
+	command := data[0]
+	if command < CmdNew || command > CmdClose {
+		return nil, data
+	}
+
+	var id uuid.UUID
+	copy(id[:], data[CommandSize:CommandSize+UUIDSize])
+
+	dataLength := binary.BigEndian.Uint32(data[CommandSize+UUIDSize : HeaderSize])
+
+	totalSize := HeaderSize + int(dataLength)
+	if len(data) < totalSize {
+		return nil, data
+	}
+
+	var packetData []byte
+	if dataLength > 0 {
+		packetData = make([]byte, dataLength)
+		copy(packetData, data[HeaderSize:totalSize])
+	}
+
+	return NewPacket(command, id, packetData), data[totalSize:]
+}

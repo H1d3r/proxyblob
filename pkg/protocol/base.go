@@ -41,6 +41,9 @@ type BaseHandler struct {
 	// conn handles underlying packet transmission (direct net.Conn)
 	conn net.Conn
 
+	// writeCh buffers encoded packets for the writeLoop goroutine
+	writeCh chan []byte
+
 	// Connections maps UUIDs to active Connection objects
 	Connections sync.Map
 
@@ -64,11 +67,14 @@ func NewBaseHandler(parentCtx context.Context, conn net.Conn) *BaseHandler {
 		parentCtx = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parentCtx)
-	return &BaseHandler{
-		conn:   conn,
-		Ctx:    ctx,
-		Cancel: cancel,
+	h := &BaseHandler{
+		conn:    conn,
+		writeCh: make(chan []byte, 1024),
+		Ctx:     ctx,
+		Cancel:  cancel,
 	}
+	go h.writeLoop()
+	return h
 }
 
 // ReceiveLoop processes incoming packets until EOF or context cancellation.
@@ -127,18 +133,21 @@ func (h *BaseHandler) ReceiveLoop() {
 			continue
 		}
 
-		packet := Decode(data)
-		if packet == nil {
-			continue
-		}
-
-		errCode := h.handlePacket(packet)
-		if errCode != ErrNone {
-			if h.Ctx.Err() != nil {
-				continue
+		// Decode all packets in the message (write coalescing may batch multiple)
+		for len(data) >= HeaderSize {
+			packet, rest := DecodeNext(data)
+			if packet == nil {
+				break
 			}
-			// Async close dispatch to avoid blocking ReceiveLoop on aznet writes
-			go h.SendClose(packet.ConnectionID, errCode)
+			errCode := h.handlePacket(packet)
+			if errCode != ErrNone {
+				if h.Ctx.Err() != nil {
+					break
+				}
+				// Async close dispatch to avoid blocking ReceiveLoop on aznet writes
+				go h.SendClose(packet.ConnectionID, errCode)
+			}
+			data = rest
 		}
 	}
 }
@@ -196,8 +205,8 @@ func (h *BaseHandler) SendClose(connectionID uuid.UUID, errCode byte) byte {
 	return h.sendPacket(CmdClose, connectionID, []byte{errCode})
 }
 
-// sendPacket is the internal method that encodes and sends all packet types.
-// It handles error checking and context checking.
+// sendPacket encodes a packet and submits it to the write coalescing channel.
+// The actual aznet write happens asynchronously in writeLoop.
 func (h *BaseHandler) sendPacket(cmd byte, connectionID uuid.UUID, data []byte) byte {
 	if h.Ctx.Err() != nil {
 		return ErrHandlerStopped
@@ -213,15 +222,44 @@ func (h *BaseHandler) sendPacket(cmd byte, connectionID uuid.UUID, data []byte) 
 		return ErrInvalidPacket
 	}
 
-	_, err := h.conn.Write(encoded)
-	if err != nil {
-		if err == io.EOF {
-			return ErrTransportClosed
-		}
-		return ErrTransportError
+	select {
+	case h.writeCh <- encoded:
+		return ErrNone
+	case <-h.Ctx.Done():
+		return ErrHandlerStopped
 	}
+}
 
-	return ErrNone
+// writeLoop coalesces queued packets and writes them in batches to aznet.
+// Only this goroutine calls conn.Write, eliminating fmu contention.
+func (h *BaseHandler) writeLoop() {
+	for {
+		var buf []byte
+
+		// Wait for the first packet
+		select {
+		case first := <-h.writeCh:
+			buf = append(buf, first...)
+		case <-h.Ctx.Done():
+			return
+		}
+
+		// Drain all queued packets (non-blocking)
+		for {
+			select {
+			case more := <-h.writeCh:
+				buf = append(buf, more...)
+			default:
+				goto flush
+			}
+		}
+
+	flush:
+		if _, err := h.conn.Write(buf); err != nil {
+			h.Cancel()
+			return
+		}
+	}
 }
 
 func (h *BaseHandler) CloseAllConnections() {

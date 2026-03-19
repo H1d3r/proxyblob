@@ -1,5 +1,6 @@
 agent
 agent.exe
+agent.wasm
 !agent/
 proxy
 proxy.exe
@@ -8,8 +9,8 @@ config.json
 *-config.json
 .DS_Store
 .cursor/
+.claude/
 CLAUDE.md
-AGENTS.md
 *.txt
 __blobstorage__/
 __azurite*.json

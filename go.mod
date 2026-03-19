@@ -36,7 +36,15 @@ require (
 )
 
 require (
-	github.com/atsika/aznet v0.0.0-20260216144450-1395eae946cd
+	github.com/atsika/aznet v0.0.0-20260319000323-1bb45b486a9e
 	github.com/jedib0t/go-pretty v4.3.0+incompatible
 	github.com/rs/zerolog v1.34.0
+)
+
+replace (
+	github.com/Azure/azure-sdk-for-go/sdk/azcore => ./pkg/azure-sdk/sdk/azcore
+	github.com/Azure/azure-sdk-for-go/sdk/data/aztables => ./pkg/azure-sdk/sdk/data/aztables
+	github.com/Azure/azure-sdk-for-go/sdk/internal => ./pkg/azure-sdk/sdk/internal
+	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob => ./pkg/azure-sdk/sdk/storage/azblob
+	github.com/Azure/azure-sdk-for-go/sdk/storage/azqueue => ./pkg/azure-sdk/sdk/storage/azqueue
 )
