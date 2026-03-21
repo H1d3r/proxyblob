@@ -183,7 +183,7 @@ func (s *ProxyServer) handleConnection(clientConn net.Conn) {
 	}
 
 	// 2. Wait for agent acknowledgment with timeout (ProtocolConn will be created in OnAck)
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(30 * time.Second)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 

@@ -48,7 +48,7 @@ func NewConnection(id uuid.UUID) *Connection {
 	return &Connection{
 		ID:           id,
 		Closed:       make(chan struct{}),
-		deliverCh:    make(chan []byte, 256),
+		deliverCh:    make(chan []byte, 1024),
 		CreatedAt:    time.Now(),
 		LastActivity: time.Now(),
 	}

@@ -4,310 +4,153 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"os"
 	"time"
 
 	"proxyblob/pkg/protocol"
 )
 
 // handleUDPAssociate processes the SOCKS5 UDP ASSOCIATE command.
-// It creates a UDP relay that allows clients to send and receive
-// UDP datagrams through the SOCKS server.
-//
-// The process involves:
-//  1. Creating a UDP socket for client communication
-//  2. Sending the socket address back to the client
-//  3. Maintaining the TCP control connection
-//  4. Relaying UDP datagrams between client and targets
-//
-// The command format follows RFC 1928 Section 4.
+// It creates a single UDP relay socket, tells the client which port to use,
+// then dispatches all relay logic to handleUDPPackets.
 func (h *SocksHandler) handleUDPAssociate(conn *protocol.Connection) byte {
-	// Create UDP socket
-	udpAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:0")
+	udpConn, err := listenUDP()
 	if err != nil {
-		// Send network unreachable error
 		h.SendError(conn, protocol.ErrNetworkUnreachable)
 		return protocol.ErrNetworkUnreachable
 	}
 
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		// Map network error to appropriate protocol error code
-		errCode := protocol.MapNetError(err)
-		h.SendError(conn, errCode)
-		return errCode
-	}
+	port := udpConn.LocalPort()
 
-	// Get the allocated port
-	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
-	port := localAddr.Port
-
-	// Create response
-	// Format: |VER|REP|RSV|ATYP|BND.ADDR|BND.PORT|
+	// Send success response: VER REP RSV ATYP BND.ADDR(4) BND.PORT(2)
 	response := []byte{
-		Version5,   // VER
-		Succeeded,  // REP - success
-		0,          // RSV - reserved, must be 0
-		IPv4,       // ATYP - IPv4
-		0, 0, 0, 0, // BND.ADDR - 0.0.0.0 (any address)
-		byte(port >> 8),   // BND.PORT - high byte
-		byte(port & 0xff), // BND.PORT - low byte
+		Version5, Succeeded, 0, IPv4,
+		0, 0, 0, 0,
+		byte(port >> 8), byte(port & 0xff),
 	}
-
-	errCode := h.SendData(conn.ID, response)
-	if errCode != protocol.ErrNone {
+	if errCode := h.SendData(conn.ID, response); errCode != protocol.ErrNone {
 		udpConn.Close()
 		return protocol.ErrPacketSendFailed
 	}
 
-	// Store UDP connection and start handling packets (state is already established via ProtocolConn)
-	conn.Conn = udpConn
+	go h.handleUDPPackets(conn, udpConn)
 
-	go h.handleUDPPackets(conn)
-
-	// Keep the control connection open until it's closed elsewhere
+	// Hold the control connection open; close the socket when context dies.
 	select {
 	case <-conn.Closed:
-		// Control connection closed, UDP associate terminated
 	case <-h.Ctx.Done():
 		udpConn.Close()
 	}
-
 	return protocol.ErrNone
 }
 
-// handleUDPPackets manages the UDP relay for a client.
-// It:
-//   - Receives UDP packets from the client
-//   - Extracts target addresses from SOCKS headers
-//   - Forwards packets to targets
-//   - Receives responses from targets
-//   - Wraps responses in SOCKS headers
-//   - Returns them to the client
+// handleUDPPackets relays UDP datagrams between the SOCKS client and internet targets.
 //
-// The relay operates until the control connection closes or
-// the context is canceled.
-func (h *SocksHandler) handleUDPPackets(conn *protocol.Connection) {
-	udpConn := conn.Conn.(*net.UDPConn)
-	buffer := make([]byte, 16*1024) // Reduced from 64KB to 16KB
+// A single socket handles both directions:
+//   - Packets from clientAddr → strip SOCKS5 header → forward to target
+//   - Packets from a known target → wrap in SOCKS5 header → forward to clientAddr
+func (h *SocksHandler) handleUDPPackets(conn *protocol.Connection, udpConn UDPRelayConn) {
+	defer udpConn.Close()
+
+	buf := make([]byte, 16*1024)
 	var clientAddr *net.UDPAddr
 
-	// Create a UDP connection for sending to targets
-	targetConn, err := net.ListenUDP("udp", nil)
-	if err != nil {
-		h.SendClose(conn.ID, protocol.ErrNetworkUnreachable)
-		return
-	}
-
-	// Ensure connections are properly closed when this handler exits
-	defer targetConn.Close()
-
-	// Map to track target addresses and their corresponding responses
 	type targetInfo struct {
 		addr       *net.UDPAddr
 		lastActive time.Time
 	}
 	targets := make(map[string]*targetInfo)
 
-	// Channel for receiving UDP responses
-	responses := make(chan struct {
-		data []byte
-		addr *net.UDPAddr
-	}, 100)
-
-	// Start a goroutine to handle responses
-	go func() {
-		respBuf := make([]byte, 16*1024) // Reduced from 128KB to 16KB
-		for {
-			// Check for cancellation
-			select {
-			case <-h.Ctx.Done():
-				return
-			case <-conn.Closed:
-				return
-			default:
-				// Continue processing
-			}
-
-			// Set read deadline to 100ms for faster response (reduced from 300ms)
-			if err := targetConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					return
-				}
-				continue // Non-fatal, just retry
-			}
-
-			n, addr, err := targetConn.ReadFromUDP(respBuf)
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					return
-				}
-				continue
-			}
-
-			if n > 0 {
-				// Make a copy of the data since respBuf will be reused
-				data := make([]byte, n)
-				copy(data, respBuf[:n])
-
-				// Send response through channel
-				select {
-				case responses <- struct {
-					data []byte
-					addr *net.UDPAddr
-				}{data, addr}:
-					// Successfully sent
-				default:
-					// Channel full, log and continue
-				}
-			}
-		}
-	}()
-
-	// Timeout to clean up inactive targets
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	cleanup := time.NewTicker(30 * time.Second)
+	defer cleanup.Stop()
 
 	for {
+		// Check for shutdown before blocking on I/O.
 		select {
 		case <-h.Ctx.Done():
 			return
 		case <-conn.Closed:
 			return
-		case resp := <-responses:
-			// Find the target that matches this response
-			var found bool
-
-			for _, target := range targets {
-				if target.addr.IP.Equal(resp.addr.IP) && target.addr.Port == resp.addr.Port {
-					// Update last active time
-					target.lastActive = time.Now()
-					found = true
-					break
-				}
-			}
-
-			if !found {
-				// Skip unknown targets
-				continue
-			}
-
-			if clientAddr == nil {
-				// Skip client address not set
-				continue
-			}
-
-			// Create response packet with appropriate header
-			// For simplicity, we'll just use a minimal header with the correct address type
-			var respHeader []byte
-
-			// Determine address type
-			var addrType byte
-			if resp.addr.IP.To4() != nil {
-				addrType = IPv4
-			} else {
-				addrType = IPv6
-			}
-
-			// header: RSV(2) + FRAG(0) + ATYP(1) + ADDR + PORT(2)
-			respHeader = append(respHeader, 0, 0, 0, addrType)
-
-			if addrType == IPv4 {
-				respHeader = append(respHeader, resp.addr.IP.To4()...)
-			} else {
-				respHeader = append(respHeader, resp.addr.IP.To16()...)
-			}
-
-			// Add port
-			portBytes := make([]byte, 2)
-			binary.BigEndian.PutUint16(portBytes, uint16(resp.addr.Port))
-			respHeader = append(respHeader, portBytes...)
-
-			// Combine header and payload
-			respPacket := append(respHeader, resp.data...)
-
-			_, err = udpConn.WriteToUDP(respPacket, clientAddr)
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					return
-				}
-			}
-
-		case <-ticker.C:
-			// Clean up inactive targets
+		case <-cleanup.C:
 			now := time.Now()
-			for targetKey, targetInfo := range targets {
-				if now.Sub(targetInfo.lastActive) > 1*time.Minute {
-					delete(targets, targetKey)
+			for k, t := range targets {
+				if now.Sub(t.lastActive) > time.Minute {
+					delete(targets, k)
 				}
 			}
-
 		default:
-			// Set read deadline to 100ms for faster response (reduced from 300ms)
-			if err := udpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					return
-				}
-				continue // Non-fatal
+		}
+
+		udpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, addr, err := udpConn.ReadFrom(buf)
+		if err != nil {
+			if isUDPTimeout(err) {
+				continue
 			}
-
-			n, remoteAddr, err := udpConn.ReadFromUDP(buffer)
-			if err != nil {
-				// Handle various error conditions
-				if errors.Is(err, net.ErrClosed) {
-					return
-				}
-
-				if netErr, ok := err.(net.Error); ok {
-					if netErr.Timeout() {
-						// This is expected due to deadline, don't log
-						continue
-					}
-				}
-
-				h.SendClose(conn.ID, protocol.ErrNetworkUnreachable)
+			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			h.SendClose(conn.ID, protocol.ErrNetworkUnreachable)
+			return
+		}
 
-			// Store client address from first packet
-			if clientAddr == nil {
-				clientAddr = remoteAddr
-			}
+		if n == 0 {
+			continue
+		}
 
-			// Only accept packets from original client
-			if !remoteAddr.IP.Equal(clientAddr.IP) {
+		if clientAddr == nil {
+			// First valid SOCKS5 UDP datagram (RSV=0x0000, FRAG=0) sets the client.
+			if n > 3 && buf[0] == 0 && buf[1] == 0 && buf[2] == 0 {
+				clientAddr = addr
+			} else {
 				continue
 			}
+		}
 
-			// Handle UDP packet
-			if n > 3 {
-				// Extract target address from UDP header
-				targetAddr, headerLen, errCode := ExtractUDPHeader(buffer[:n])
-				if errCode != protocol.ErrNone {
+		if addr.IP.Equal(clientAddr.IP) && addr.Port == clientAddr.Port {
+			// Client → target
+			if n <= 3 {
+				continue
+			}
+			targetAddr, headerLen, errCode := ExtractUDPHeader(buf[:n])
+			if errCode != protocol.ErrNone {
+				continue
+			}
+			targetUDPAddr, err := net.ResolveUDPAddr("udp", targetAddr)
+			if err != nil {
+				continue
+			}
+			targets[targetAddr] = &targetInfo{addr: targetUDPAddr, lastActive: time.Now()}
+			udpConn.WriteTo(buf[headerLen:n], targetUDPAddr)
+		} else {
+			// Target → client: find the matching target entry and wrap with SOCKS5 header.
+			for _, t := range targets {
+				if !t.addr.IP.Equal(addr.IP) || t.addr.Port != addr.Port {
 					continue
 				}
+				t.lastActive = time.Now()
 
-				// Resolve target address
-				targetUDPAddr, err := net.ResolveUDPAddr("udp", targetAddr)
-				if err != nil {
-					continue
+				var header []byte
+				if ip4 := addr.IP.To4(); ip4 != nil {
+					header = append([]byte{0, 0, 0, IPv4}, ip4...)
+				} else {
+					header = append([]byte{0, 0, 0, IPv6}, addr.IP.To16()...)
 				}
+				var portBuf [2]byte
+				binary.BigEndian.PutUint16(portBuf[:], uint16(addr.Port))
+				header = append(header, portBuf[:]...)
 
-				// Store target information
-				targetKey := targetAddr
-				targets[targetKey] = &targetInfo{
-					addr:       targetUDPAddr,
-					lastActive: time.Now(),
-				}
-
-				// Send payload to target
-				_, err = targetConn.WriteToUDP(buffer[headerLen:n], targetUDPAddr)
-				if err != nil {
-					if errors.Is(err, net.ErrClosed) {
-						return
-					}
-					continue
-				}
+				udpConn.WriteTo(append(header, buf[:n]...), clientAddr)
+				break
 			}
 		}
 	}
+}
+
+// isUDPTimeout reports whether err is a read-deadline / timeout error.
+func isUDPTimeout(err error) bool {
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, os.ErrDeadlineExceeded)
 }

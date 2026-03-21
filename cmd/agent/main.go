@@ -138,6 +138,12 @@ func init() {
 
 	// Use a more human-friendly output for console
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+
+	go func() {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}()
 }
 
 // main is the entry point for the agent process
@@ -146,6 +152,10 @@ func main() {
 	// Parse command line flags
 	flag.StringVar(&ConnString, "c", ConnString, "Connection string")
 	flag.Parse()
+
+	if ConnString == "" {
+		ConnString = os.Getenv("CONNECTION_STRING")
+	}
 
 	if ConnString == "" {
 		os.Exit(ErrNoConnectionString)

@@ -34,8 +34,8 @@ const banner = `
     |_|   |_|  \___/_/\_\\__, |____/|_|\___/|_.__/ 
                          |___/                     
 
-  SOCKS Proxy over More Azure Storage (v2.0 - aznet)
-  --------------------------------------------------
+   SOCKS Proxy over More Azure Storage (v2.1 - wasm)
+   -------------------------------------------------
 
 `
 
@@ -619,8 +619,8 @@ func formatRelativeTime(t time.Time) string {
 func AddCommands(app *grumble.App) {
 	// Parent command for listener management
 	listenerCmd := &grumble.Command{
-		Name:    "listener",
-		Help:    "manage listeners",
+		Name: "listener",
+		Help: "manage listeners",
 	}
 
 	// Subcommand: listener list
@@ -745,8 +745,8 @@ func AddCommands(app *grumble.App) {
 
 	// Command to create a new agent connection string
 	app.AddCommand(&grumble.Command{
-		Name:    "new",
-		Help:    "generate a new connection string for an agent",
+		Name: "new",
+		Help: "generate a new connection string for an agent",
 		Flags: func(f *grumble.Flags) {
 			f.Duration("d", "duration", 7*24*time.Hour, "duration for the SAS token (default 7 days)")
 			f.String("l", "listener", "", "listener ID to use (defaults to selected listener)")
@@ -789,8 +789,8 @@ func AddCommands(app *grumble.App) {
 
 	// Parent command for agent management
 	agentCmd := &grumble.Command{
-		Name:    "agent",
-		Help:    "manage agents",
+		Name: "agent",
+		Help: "manage agents",
 	}
 
 	// Subcommand: agent list
@@ -839,8 +839,8 @@ func AddCommands(app *grumble.App) {
 
 	// Subcommand: agent start
 	agentCmd.AddCommand(&grumble.Command{
-		Name:    "start",
-		Help:    "start SOCKS proxy for the selected agent",
+		Name: "start",
+		Help: "start SOCKS proxy for the selected agent",
 		Flags: func(f *grumble.Flags) {
 			f.String("l", "listen", "127.0.0.1:1080", "listen address for SOCKS server")
 		},

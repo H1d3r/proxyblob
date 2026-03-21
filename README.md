@@ -23,6 +23,7 @@ The system consists of two components:
 - Interactive CLI with auto-completion
 - Multiple agent management
 - Local or remote proxy server
+- WebAssembly (WASM) agent for deployment in JavaScript runtimes (Bun, Node.js, etc.)
 
 ## Prerequisites
 
@@ -120,11 +121,11 @@ The default storage account name is `devstoreaccount1` and the account key is `E
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/quarkslab/proxyblob
+# Clone the repository (include submodules)
+git clone --recurse-submodules https://github.com/quarkslab/proxyblob
 cd proxyblob
 
-# Build both components
+# Build all components
 make
 ```
 
@@ -132,6 +133,29 @@ This will produce the following binaries:
 
 - `proxy` - the proxy server running on your machine
 - `agent` - the agent running on the target
+- `agent.wasm` - the agent compiled for WebAssembly
+
+The WASM agent requires the JS host runtime to expose two global functions:
+
+```js
+// Open a TCP connection to host:port, call callbacks on events
+TCPDial(host, port, onConnect, onData, onClose, onError)
+
+// Bind a UDP socket on a random port, call callbacks on events
+UDPListen(onBind, onData, onError)
+```
+
+The runner is responsible for implementing these using the runtime's native APIs (e.g. Bun: `Bun.connect` / `Bun.udpSocket`, Node.js: `net` / `dgram`).
+
+You can also build targets individually:
+
+```bash
+make proxy                        # proxy server only
+make agent                        # native agent only
+make wasm                         # WASM agent only
+make agent TOKEN=<conn-string>    # native agent with embedded connection string
+make wasm TOKEN=<conn-string>     # WASM agent with embedded connection string
+```
 
 ## Configuration
 
@@ -400,6 +424,12 @@ If you encounter issues:
 - Improve proxy speed even more
 
 ## CHANGELOG
+
+**ProxyBlob v2.1 (WASM agent) - 19/03/2026:**
+
+- WebAssembly agent build target (`agent.wasm`) for deployment in JavaScript runtimes (Bun, Node.js, etc.)
+- Build tag separation for JS/native network and UDP code
+- Refactored UDP relay into a shared, platform-agnostic layer
 
 **ProxyBlob v2 (aznet boosted) - 16/02/2026:**
 

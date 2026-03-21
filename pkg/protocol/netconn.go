@@ -29,7 +29,7 @@ func NewProtocolConn(ctx context.Context, id uuid.UUID, handler *BaseHandler) *P
 	return &ProtocolConn{
 		id:         id,
 		handler:    handler,
-		readBuffer: make(chan []byte, 100), // Buffered channel for received data
+		readBuffer: make(chan []byte, 1024), // Buffered channel for received data
 		closed:     make(chan struct{}),
 		ctx:        ctx,
 	}
