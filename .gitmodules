@@ -1,3 +1,0 @@
-[submodule "pkg/azure-sdk"]
-	path = pkg/azure-sdk
-	url = https://github.com/Atsika/azure-sdk-for-go.git
