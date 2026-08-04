@@ -34,7 +34,7 @@ const banner = `
     |_|   |_|  \___/_/\_\\__, |____/|_|\___/|_.__/ 
                          |___/                     
 
-   SOCKS Proxy over More Azure Storage (v2.1 - wasm)
+   SOCKS Proxy over More Azure Storage (v2.2 - wasm)
    -------------------------------------------------
 
 `

@@ -121,8 +121,8 @@ The default storage account name is `devstoreaccount1` and the account key is `E
 ## Installation
 
 ```bash
-# Clone the repository (include submodules)
-git clone --recurse-submodules https://github.com/quarkslab/proxyblob
+# Clone the repository
+git clone https://github.com/quarkslab/proxyblob
 cd proxyblob
 
 # Build all components
@@ -424,6 +424,11 @@ If you encounter issues:
 - Improve proxy speed even more
 
 ## CHANGELOG
+
+**ProxyBlob v2.2 - 03/08/2026:**
+
+- Dropped the vendored `azure-sdk-for-go` submodule; the WASM fix it carried is now upstream ([Azure/azure-sdk-for-go#26748](https://github.com/Azure/azure-sdk-for-go/pull/26748))
+- Azure SDK dependencies bumped and resolved from upstream, so a plain `git clone` is enough to build
 
 **ProxyBlob v2.1 (WASM agent) - 19/03/2026:**
 
