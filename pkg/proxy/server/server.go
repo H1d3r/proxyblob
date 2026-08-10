@@ -99,11 +99,18 @@ func (s *ProxyServer) OnData(connectionID uuid.UUID, data []byte) byte {
 	conn := value.(*protocol.Connection)
 	conn.LastActivity = time.Now()
 
-	// Non-blocking delivery to per-connection goroutine
-	if conn.ProtocolConn != nil {
-		if !conn.Deliver(data) {
-			return protocol.ErrBufferFull
-		}
+	// The connection is only ready to receive data once OnAck has created the
+	// virtual protocol connection. Dropping the payload here would be silent
+	// data loss, so report the unexpected state instead.
+	if conn.ProtocolConn == nil {
+		return protocol.ErrInvalidState
+	}
+
+	// Deliver blocks until the payload is accepted by the per-connection
+	// goroutine, so back-pressure never discards data. A false return means the
+	// connection is closed or the handler is shutting down.
+	if !conn.Deliver(data) {
+		return protocol.ErrConnectionClosed
 	}
 	return protocol.ErrNone
 }
@@ -172,7 +179,7 @@ func (s *ProxyServer) handleConnection(clientConn net.Conn) {
 	}
 
 	connID := uuid.New()
-	proxyConn := protocol.NewConnection(connID)
+	proxyConn := protocol.NewConnection(connID, s.Ctx.Done())
 	s.Connections.Store(proxyConn.ID, proxyConn)
 
 	// 1. Initiate connection with the agent

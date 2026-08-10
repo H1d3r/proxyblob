@@ -4,8 +4,10 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -400,13 +402,25 @@ func AcceptAgentLoopForListener(ctx context.Context, listenerID string, listener
 		// Generate a unique ID for this agent connection
 		agentID := uuid.New().String()
 
-		// Read agent identity (user@host) with 5-second timeout
-		info := "unknown"
+		// Read the agent identity (user@host) with a 5-second timeout.
+		//
+		// Wire format: 2-byte big-endian length N (1 <= N <= maxIdentityLen), followed by
+		// exactly N bytes of identity payload. Both reads use io.ReadFull: a bare Read on a
+		// byte stream may return fewer bytes than requested, and any leftover identity bytes
+		// would then be parsed as a record header and desynchronize the stream permanently.
+		//
+		// FLAG DAY: this framing must match the writer in cmd/agent/main.go (NewAgent).
+		// There is no backward compatibility with the old unframed exchange -- agent and
+		// proxy must be rebuilt and deployed together.
+		//
+		// Any failure here is fatal for this connection: we close it and move on rather
+		// than proceeding with an "unknown" identity over a possibly poisoned stream.
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		buf := make([]byte, 512)
-		n, err := conn.Read(buf)
-		if err == nil && n > 0 {
-			info = string(buf[:n])
+		info, err := readAgentIdentity(conn)
+		if err != nil {
+			log.Error().Err(err).Str("listener_id", listenerID).Msg("Failed to read agent identity, dropping connection")
+			conn.Close()
+			continue
 		}
 		conn.SetReadDeadline(time.Time{})
 
@@ -428,6 +442,33 @@ func AcceptAgentLoopForListener(ctx context.Context, listenerID string, listener
 		// Monitor connection in background
 		go monitorAgent(ctx, agentID, conn)
 	}
+}
+
+// maxIdentityLen bounds the identity payload the proxy is willing to accept.
+// Must match MaxIdentityLen in cmd/agent/main.go.
+const maxIdentityLen = 512
+
+// readAgentIdentity reads one length-prefixed identity frame from conn:
+// a 2-byte big-endian length followed by exactly that many bytes.
+// It uses io.ReadFull for both reads so a short read is reported as an error
+// instead of silently leaving identity bytes in the stream.
+func readAgentIdentity(conn net.Conn) (string, error) {
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		return "", fmt.Errorf("read identity length: %w", err)
+	}
+
+	length := binary.BigEndian.Uint16(lenBuf[:])
+	if length == 0 || int(length) > maxIdentityLen {
+		return "", fmt.Errorf("identity length %d out of range (1-%d)", length, maxIdentityLen)
+	}
+
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return "", fmt.Errorf("read identity payload (%d bytes): %w", length, err)
+	}
+
+	return string(buf), nil
 }
 
 // monitorAgent watches for agent disconnection via proxy server context.
