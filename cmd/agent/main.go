@@ -53,8 +53,10 @@ func NewAgent(ctx context.Context, connString string) (*Agent, int) {
 		return nil, errCode
 	}
 
-	// Dial to the proxy using aznet with ULTRA-aggressive polling (WARNING: High API costs!)
-	conn, err := aznet.Dial(driver, address, aznet.WithContext(ctx), aznet.WithFastPoll(time.Millisecond))
+	// Dial to the proxy, leaving the polling intervals at aznet's defaults.
+	// Polling faster than the default mostly bills empty reads, and the added
+	// request volume competes with the transfers it is meant to accelerate.
+	conn, err := aznet.Dial(driver, address, aznet.WithContext(ctx))
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to dial proxy")
 		return nil, ErrConnectionStringError
