@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,7 +29,12 @@ const (
 	ErrContextCanceled       = 1 // context canceled
 	ErrNoConnectionString    = 2 // missing connection string
 	ErrConnectionStringError = 3 // invalid connection string
+	ErrIdentityExchange      = 4 // identity handshake failed
 )
+
+// MaxIdentityLen bounds the identity payload so the 2-byte length prefix can never
+// disagree with the bytes that follow. Must match the proxy-side limit.
+const MaxIdentityLen = 512
 
 // ConnString holds the Azure connection string.
 // Can be set at compile time or via command line flag.
@@ -55,10 +61,29 @@ func NewAgent(ctx context.Context, connString string) (*Agent, int) {
 	}
 	log.Info().Msg("Connected to proxy")
 
-	// Send identity (user@host) as first raw message before protocol starts
+	// Send identity (user@host) as the first message, before the record protocol starts.
+	//
+	// Wire format: 2-byte big-endian length N (1 <= N <= MaxIdentityLen), followed by
+	// exactly N bytes of identity payload. The prefix and payload are emitted as a single
+	// Write so no other writer can interleave bytes between them.
+	//
+	// FLAG DAY: this framing must match the reader in cmd/proxy/main.go
+	// (AcceptAgentLoopForListener). There is no backward compatibility with the old
+	// unframed exchange -- agent and proxy must be rebuilt and deployed together.
 	identity := getIdentity()
-	if _, err := conn.Write([]byte(identity)); err != nil {
-		log.Warn().Err(err).Msg("Failed to send identity")
+	if len(identity) > MaxIdentityLen {
+		identity = identity[:MaxIdentityLen]
+	}
+	identityFrame := make([]byte, 2+len(identity))
+	binary.BigEndian.PutUint16(identityFrame[:2], uint16(len(identity)))
+	copy(identityFrame[2:], identity)
+	if _, err := conn.Write(identityFrame); err != nil {
+		// Fatal for this connection: a partial identity leaves unconsumed bytes at the
+		// head of the peer's stream, which would be parsed as a record header and
+		// desynchronize framing permanently. Aborting is strictly safer than continuing.
+		log.Error().Err(err).Msg("Failed to send identity")
+		conn.Close()
+		return nil, ErrIdentityExchange
 	}
 
 	// Create SOCKS handler with direct connection (no transport wrapper)

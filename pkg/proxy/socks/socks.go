@@ -52,7 +52,7 @@ func (h *SocksHandler) OnNew(connectionID uuid.UUID, data []byte) byte {
 	}
 
 	// Create new connection
-	conn := protocol.NewConnection(connectionID)
+	conn := protocol.NewConnection(connectionID, h.Ctx.Done())
 	h.Connections.Store(conn.ID, conn)
 
 	// Create the virtual protocol connection
@@ -77,8 +77,10 @@ func (h *SocksHandler) OnAck(connectionID uuid.UUID, data []byte) byte {
 	return protocol.ErrUnexpectedPacket
 }
 
-// OnData processes incoming data for a connection.
-// Data is forwarded directly (handled by transport layer).
+// OnData processes incoming data for a connection by handing the payload to
+// the connection's delivery goroutine, which feeds the virtual protocol
+// connection read by the SOCKS flow. The call blocks while the reader is busy,
+// applying back-pressure rather than dropping data.
 func (h *SocksHandler) OnData(connectionID uuid.UUID, data []byte) byte {
 	value, ok := h.Connections.Load(connectionID)
 	if !ok {
@@ -86,11 +88,17 @@ func (h *SocksHandler) OnData(connectionID uuid.UUID, data []byte) byte {
 	}
 	conn := value.(*protocol.Connection)
 
-	// Non-blocking delivery to per-connection goroutine
-	if conn.ProtocolConn != nil {
-		if !conn.Deliver(data) {
-			return protocol.ErrBufferFull
-		}
+	// Without a virtual protocol connection there is no reader for the payload.
+	// Dropping it would be silent data loss, so report the unexpected state.
+	if conn.ProtocolConn == nil {
+		return protocol.ErrInvalidState
+	}
+
+	// Deliver blocks until the payload is accepted by the per-connection
+	// goroutine, so back-pressure never discards data. A false return means the
+	// connection is closed or the handler is shutting down.
+	if !conn.Deliver(data) {
+		return protocol.ErrConnectionClosed
 	}
 	return protocol.ErrNone
 }

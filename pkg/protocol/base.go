@@ -2,12 +2,16 @@ package protocol
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
+	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
 // PacketHandler processes protocol packets and manages connection lifecycle.
@@ -77,17 +81,38 @@ func NewBaseHandler(parentCtx context.Context, conn net.Conn) *BaseHandler {
 	return h
 }
 
-// ReceiveLoop processes incoming packets until EOF or context cancellation.
-// Uses exponential backoff on transient errors but never exits silently.
+// ReceiveLoop processes incoming packets until the transport dies or the
+// context is cancelled. Uses exponential backoff on transient errors but never
+// exits silently.
 func (h *BaseHandler) ReceiveLoop() {
+	// A panic here would otherwise unwind to the top of this goroutine and kill
+	// the process, taking down every listener and every connected agent at once.
+	// Contain it and tear down only this handler.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().
+				Interface("panic", r).
+				Str("stack", string(debug.Stack())).
+				Msg("Recovered panic in protocol receive loop")
+			h.Stop()
+		}
+	}()
+
 	consecutiveErrors := 0
 	const maxBackoff = 5 * time.Second
+	// Highest shift applied to the 100ms base delay. 100ms<<6 = 6.4s already
+	// exceeds maxBackoff, and clamping keeps the shift far away from the point
+	// (58) where the int64 shift wraps negative, which would defeat the cap and
+	// make time.After fire immediately in a 100% CPU hot loop.
+	const maxBackoffShift = 6
 
-	// NOTE: aznet already handles message framing and returns complete messages
-	// We don't need stream buffering - each Read() returns ONE complete message
-
-	// Allocate buffer once and reuse it (16MB is the max frame size in aznet)
+	// The transport is a plain byte stream: it does not preserve message
+	// boundaries. A single Read may return a fragment of a record, several
+	// records back to back, or a whole record plus the head of the next one.
+	// The accumulator below therefore lives OUTSIDE the read loop so that a
+	// record straddling two Read calls is reassembled rather than discarded.
 	buffer := make([]byte, 16*1024*1024)
+	acc := make([]byte, 0, HeaderSize+MaxPacketDataSize)
 
 	for {
 		select {
@@ -96,10 +121,15 @@ func (h *BaseHandler) ReceiveLoop() {
 		default:
 		}
 
-		// Read directly from connection (aznet handles framing)
 		n, err := h.conn.Read(buffer)
 		if err != nil {
-			if err == io.EOF {
+			// Terminal transport errors: the connection will never yield bytes
+			// again, so backing off would spin forever while h.Stop() never runs
+			// and every logical connection hangs instead of being reset.
+			if errors.Is(err, io.EOF) ||
+				errors.Is(err, net.ErrClosed) ||
+				errors.Is(err, io.ErrClosedPipe) ||
+				errors.Is(err, os.ErrDeadlineExceeded) {
 				h.Stop()
 				return
 			}
@@ -110,7 +140,11 @@ func (h *BaseHandler) ReceiveLoop() {
 
 			// Transient error: exponential backoff (100ms, 200ms, 400ms, ... capped at 5s)
 			consecutiveErrors++
-			backoff := time.Duration(100<<uint(consecutiveErrors-1)) * time.Millisecond
+			shift := consecutiveErrors - 1
+			if shift > maxBackoffShift {
+				shift = maxBackoffShift
+			}
+			backoff := time.Duration(100<<uint(shift)) * time.Millisecond
 			if backoff > maxBackoff {
 				backoff = maxBackoff
 			}
@@ -127,27 +161,57 @@ func (h *BaseHandler) ReceiveLoop() {
 		if h.OnReceive != nil {
 			h.OnReceive()
 		}
-		data := buffer[:n]
 
-		if len(data) == 0 {
+		if n == 0 {
 			continue
 		}
 
-		// Decode all packets in the message (write coalescing may batch multiple)
-		for len(data) >= HeaderSize {
-			packet, rest := DecodeNext(data)
-			if packet == nil {
-				break
+		acc = append(acc, buffer[:n]...)
+
+		// Drain every complete record currently buffered. offset tracks how much
+		// of acc has been consumed so the remainder can be kept for the next Read.
+		offset := 0
+		for {
+			packet, consumed, perr := ParseNext(acc[offset:])
+			if perr != nil {
+				if errors.Is(perr, ErrShortPacket) {
+					// Nothing was consumed: the trailing bytes are the head of a
+					// record whose tail has not arrived yet. Keep them.
+					break
+				}
+
+				// Malformed framing is unrecoverable. A length-prefixed stream has
+				// no resync point, and the uuid in a bogus header is garbage, so
+				// closing "just that connection" would target a random one while
+				// the stream stayed misaligned. Tear the handler down.
+				log.Error().
+					Err(perr).
+					Int("buffered", len(acc)-offset).
+					Msg("Malformed protocol framing, tearing down handler")
+				h.Stop()
+				return
 			}
+			offset += consumed
+
 			errCode := h.handlePacket(packet)
 			if errCode != ErrNone {
 				if h.Ctx.Err() != nil {
 					break
 				}
-				// Async close dispatch to avoid blocking ReceiveLoop on aznet writes
+				// Async close dispatch to avoid blocking ReceiveLoop on writes
 				go h.SendClose(packet.ConnectionID, errCode)
 			}
-			data = rest
+		}
+
+		// Compact only when something was consumed. copy has memmove semantics
+		// and the destination index is <= the source index, so the overlapping
+		// slide is safe.
+		if offset > 0 {
+			if offset == len(acc) {
+				acc = acc[:0]
+			} else {
+				acc = acc[:copy(acc, acc[offset:])]
+			}
 		}
 	}
 }
@@ -163,6 +227,13 @@ func (h *BaseHandler) handlePacket(packet *Packet) byte {
 	case CmdData:
 		return h.PacketHandler.OnData(packet.ConnectionID, packet.Data)
 	case CmdClose:
+		// A close carries a one byte error code; indexing an empty payload would
+		// panic. This is a per-connection error and deliberately NOT malformed
+		// framing: the length prefix was intact and the byte stream is still in
+		// sync, so it must not tear down the whole handler.
+		if len(packet.Data) == 0 {
+			return ErrInvalidPacket
+		}
 		return h.PacketHandler.OnClose(packet.ConnectionID, packet.Data[0])
 	default:
 		return ErrInvalidCommand
@@ -241,6 +312,11 @@ func (h *BaseHandler) writeLoop() {
 		case first := <-h.writeCh:
 			buf = append(buf, first...)
 		case <-h.Ctx.Done():
+			// sendPacket already reported success to its callers (ultimately to
+			// io.Copy) for everything still queued, so returning here without
+			// draining would silently discard records the peer was told to
+			// expect. Flush what is left, best effort, then exit.
+			h.drainWriteCh()
 			return
 		}
 
@@ -256,7 +332,31 @@ func (h *BaseHandler) writeLoop() {
 
 	flush:
 		if _, err := h.conn.Write(buf); err != nil {
+			// The underlying Write can return (0, err) even when part of the batch
+			// already reached the peer, so there is no safe retry: resending the
+			// batch would duplicate bytes on the wire and desynchronize the
+			// length-prefixed stream. Cancelling without retry stays correct.
 			h.Cancel()
+			return
+		}
+	}
+}
+
+// drainWriteCh empties writeCh without blocking and makes a single final write
+// attempt with whatever was still queued. Used on shutdown so that records
+// already acknowledged by sendPacket get one chance to reach the peer.
+func (h *BaseHandler) drainWriteCh() {
+	var buf []byte
+	for {
+		select {
+		case more := <-h.writeCh:
+			buf = append(buf, more...)
+		default:
+			if len(buf) > 0 {
+				// Best effort: the transport may already be gone. The same
+				// no-retry rule as in writeLoop applies to any error here.
+				_, _ = h.conn.Write(buf)
+			}
 			return
 		}
 	}

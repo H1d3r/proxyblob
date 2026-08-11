@@ -8,8 +8,25 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 
 	"github.com/google/uuid"
+)
+
+// MaxPacketDataSize is the largest payload a single packet may declare.
+// It bounds the size of a reassembly accumulator: a caller buffering a packet
+// never needs to hold more than HeaderSize + MaxPacketDataSize bytes.
+const MaxPacketDataSize = 1 << 20
+
+// Parsing errors returned by ParseNext.
+var (
+	// ErrShortPacket means the buffer holds only part of a packet. The framing
+	// seen so far is valid, so the caller should read more bytes and retry.
+	ErrShortPacket = errors.New("protocol: incomplete packet")
+
+	// ErrMalformedPacket means the header itself is invalid. The byte stream is
+	// desynchronized and cannot be recovered by reading more bytes.
+	ErrMalformedPacket = errors.New("protocol: malformed framing")
 )
 
 // Command types for protocol operations.
@@ -81,66 +98,60 @@ func (p *Packet) Encode() []byte {
 	return buf.Bytes()
 }
 
-// Decode deserializes a byte slice into a protocol packet.
-// Returns nil if the data is malformed or contains an invalid command.
-// The input must be EXACTLY one complete packet (aznet ensures this).
-func Decode(data []byte) *Packet {
-	if len(data) < HeaderSize {
-		return nil
+// ParseNext parses one packet from the front of buf, which may hold a partial
+// packet, exactly one packet, or several concatenated packets. The underlying
+// transport is a byte stream and does not preserve message boundaries, so a
+// caller must accumulate bytes and call ParseNext repeatedly, consuming the
+// reported number of bytes after each success.
+//
+// It returns:
+//
+//	(packet, consumed, nil)       success; consumed bytes may be dropped from buf
+//	(nil, 0, ErrShortPacket)      partial packet; caller should read more and retry
+//	(nil, 0, ErrMalformedPacket)  invalid header; the stream is desynchronized
+//
+// A zero-length payload is valid for every command, including CmdClose.
+// Rejecting it here would leave the byte stream out of sync, so any semantic
+// check on an empty payload belongs to the caller.
+func ParseNext(buf []byte) (*Packet, int, error) {
+	if len(buf) < HeaderSize {
+		return nil, 0, ErrShortPacket
 	}
 
-	command := data[0]
+	command := buf[0]
 	if command < CmdNew || command > CmdClose {
-		return nil
+		return nil, 0, ErrMalformedPacket
 	}
 
-	var id uuid.UUID
-	copy(id[:], data[CommandSize:CommandSize+UUIDSize])
+	dataLength := binary.BigEndian.Uint32(buf[CommandSize+UUIDSize : HeaderSize])
 
-	dataLength := binary.BigEndian.Uint32(data[CommandSize+UUIDSize : HeaderSize])
-
-	// Check exact size - aznet returns complete messages, so size must match exactly
-	if uint32(len(data)) != uint32(HeaderSize)+dataLength {
-		return nil
+	// The length cap MUST be checked before the "do we have the whole body yet"
+	// check below. A corrupted length field would otherwise be reported as
+	// ErrShortPacket, making the caller buffer up to 4 GiB waiting for a body
+	// that never arrives. Rejecting oversized lengths first bounds the caller's
+	// accumulator at HeaderSize + MaxPacketDataSize.
+	if dataLength > MaxPacketDataSize {
+		return nil, 0, ErrMalformedPacket
 	}
-
-	var packetData []byte
-	if dataLength > 0 {
-		packetData = make([]byte, dataLength)
-		copy(packetData, data[HeaderSize:])
-	}
-
-	return NewPacket(command, id, packetData)
-}
-
-// DecodeNext parses the first packet from a buffer that may contain multiple
-// concatenated packets (from write coalescing). Returns the decoded packet and
-// the remaining unconsumed bytes. Returns nil packet if data is incomplete or invalid.
-func DecodeNext(data []byte) (*Packet, []byte) {
-	if len(data) < HeaderSize {
-		return nil, data
-	}
-
-	command := data[0]
-	if command < CmdNew || command > CmdClose {
-		return nil, data
-	}
-
-	var id uuid.UUID
-	copy(id[:], data[CommandSize:CommandSize+UUIDSize])
-
-	dataLength := binary.BigEndian.Uint32(data[CommandSize+UUIDSize : HeaderSize])
 
 	totalSize := HeaderSize + int(dataLength)
-	if len(data) < totalSize {
-		return nil, data
+	if len(buf) < totalSize {
+		return nil, 0, ErrShortPacket
 	}
 
+	var id uuid.UUID
+	copy(id[:], buf[CommandSize:CommandSize+UUIDSize])
+
+	// The payload MUST be copied into a fresh allocation and must never alias
+	// buf. The returned Packet.Data is handed to another goroutine and outlives
+	// this call, while the caller's accumulator is compacted and re-appended in
+	// place; a sub-slice of buf would be read after it has been overwritten.
+	// Do not "optimize" this copy away.
 	var packetData []byte
 	if dataLength > 0 {
 		packetData = make([]byte, dataLength)
-		copy(packetData, data[HeaderSize:totalSize])
+		copy(packetData, buf[HeaderSize:totalSize])
 	}
 
-	return NewPacket(command, id, packetData), data[totalSize:]
+	return NewPacket(command, id, packetData), totalSize, nil
 }

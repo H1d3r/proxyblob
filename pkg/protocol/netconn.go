@@ -16,7 +16,7 @@ type ProtocolConn struct {
 	id           uuid.UUID
 	handler      *BaseHandler
 	readBuffer   chan []byte // internal buffer for received data
-	readData     []byte     // partial read buffer
+	readData     []byte      // partial read buffer
 	readOffset   int
 	closed       chan struct{}
 	closeOnce    sync.Once // guards SendClose (protocol-level close)
@@ -48,26 +48,46 @@ func (c *ProtocolConn) Read(b []byte) (n int, err error) {
 		return n, nil
 	}
 
-	// Wait for new data from protocol layer
+	// Wait for new data from protocol layer.
+	//
+	// Buffered data must always win over the termination signals. A single
+	// three-way select would not guarantee that: Go picks uniformly at random
+	// among ready cases, so once closed (or ctx) fires, data still sitting in
+	// readBuffer would be discarded roughly half the time per call, and always
+	// eventually. That is the normal end-of-response path (the peer's close
+	// record arrives on the same shared receive goroutine microseconds after
+	// its last data record), and it silently truncates the response body.
+	//
+	// So: try a non-blocking receive first, and only fall back to honoring
+	// closed/ctx when readBuffer is genuinely empty.
+	var (
+		data []byte
+		ok   bool
+	)
 	select {
-	case <-c.closed:
-		return 0, io.EOF
-	case <-c.ctx.Done():
-		return 0, io.EOF
-	case data, ok := <-c.readBuffer:
-		if !ok {
+	case data, ok = <-c.readBuffer:
+	default:
+		select {
+		case <-c.closed:
 			return 0, io.EOF
+		case <-c.ctx.Done():
+			return 0, io.EOF
+		case data, ok = <-c.readBuffer:
 		}
-
-		// Copy as much as possible to b
-		n = copy(b, data)
-		// If there's leftover data, store it
-		if n < len(data) {
-			c.readData = data
-			c.readOffset = n
-		}
-		return n, nil
 	}
+	if !ok {
+		// readBuffer was closed.
+		return 0, io.EOF
+	}
+
+	// Copy as much as possible to b
+	n = copy(b, data)
+	// If there's leftover data, store it
+	if n < len(data) {
+		c.readData = data
+		c.readOffset = n
+	}
+	return n, nil
 }
 
 // Write implements net.Conn.Write - sends data via protocol.
@@ -133,6 +153,19 @@ func (c *ProtocolConn) SetWriteDeadline(t time.Time) error {
 
 // DeliverData is called by the protocol handler when data arrives for this connection.
 func (c *ProtocolConn) DeliverData(data []byte) {
+	// Same reasoning as Read: a two-way select on closed and the send would
+	// drop a delivery at random whenever both are ready, even though
+	// readBuffer had room for it. Prefer the send whenever it can proceed;
+	// Read drains buffered data before reporting EOF, so data accepted after
+	// closed is still handed to the consumer.
+	select {
+	case c.readBuffer <- data:
+		return
+	default:
+	}
+
+	// readBuffer is full: block until there is room, or until the connection
+	// is torn down.
 	select {
 	case <-c.closed:
 		return
