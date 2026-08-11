@@ -42,7 +42,7 @@ require (
 )
 
 require (
-	github.com/atsika/aznet v0.0.0-20260319000323-1bb45b486a9e
+	github.com/atsika/aznet v0.0.0-20260811113231-fb862c589562
 	github.com/jedib0t/go-pretty v4.3.0+incompatible
 	github.com/rs/zerolog v1.35.1
 )
