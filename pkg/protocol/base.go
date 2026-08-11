@@ -106,6 +106,14 @@ func (h *BaseHandler) ReceiveLoop() {
 	// make time.After fire immediately in a 100% CPU hot loop.
 	const maxBackoffShift = 6
 
+	// A transport can fail permanently with an error outside the terminal set
+	// above. Retrying such an error never succeeds, and without a bound the loop
+	// would spin indefinitely while no payload moves and no connection is reset,
+	// which is externally indistinguishable from an idle tunnel. Since the
+	// backoff saturates at maxBackoff, this bound is reached only after a long
+	// run of uninterrupted failures, well beyond any transient outage.
+	const maxConsecutiveErrors = 20
+
 	// The transport is a plain byte stream: it does not preserve message
 	// boundaries. A single Read may return a fragment of a record, several
 	// records back to back, or a whole record plus the head of the next one.
@@ -140,6 +148,14 @@ func (h *BaseHandler) ReceiveLoop() {
 
 			// Transient error: exponential backoff (100ms, 200ms, 400ms, ... capped at 5s)
 			consecutiveErrors++
+			if consecutiveErrors >= maxConsecutiveErrors {
+				log.Error().
+					Err(err).
+					Int("consecutive", consecutiveErrors).
+					Msg("Transport failing persistently, tearing down handler")
+				h.Stop()
+				return
+			}
 			shift := consecutiveErrors - 1
 			if shift > maxBackoffShift {
 				shift = maxBackoffShift

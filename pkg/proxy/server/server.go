@@ -165,6 +165,21 @@ func (s *ProxyServer) acceptLoop() {
 	}
 }
 
+// AckTimeout bounds how long a new logical connection waits for the agent's
+// acknowledgment before being abandoned.
+//
+// It covers connection setup only: no payload flows until the acknowledgment
+// arrives, so the deadline is never refreshed by progress, and once the
+// connection is established no further timeout applies. It therefore bounds
+// round-trip latency under contention, not transfer duration.
+//
+// All logical connections share a single transport, so their acknowledgments
+// serialize and the last connection opened waits behind every other one. The
+// value must accommodate that queueing delay on a high-latency driver, not
+// just one round trip. The cost of a generous bound is that an unreachable
+// agent takes this long to report.
+const AckTimeout = 120 * time.Second
+
 // handleConnection processes a new client connection by:
 //   - Generating a unique connection ID
 //   - Initiating connection with remote agent
@@ -190,7 +205,7 @@ func (s *ProxyServer) handleConnection(clientConn net.Conn) {
 	}
 
 	// 2. Wait for agent acknowledgment with timeout (ProtocolConn will be created in OnAck)
-	timeout := time.After(30 * time.Second)
+	timeout := time.After(AckTimeout)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
