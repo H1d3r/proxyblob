@@ -78,12 +78,12 @@ func (s *ProxyServer) OnAck(connectionID uuid.UUID, data []byte) byte {
 	conn := value.(*protocol.Connection)
 
 	// Check if connection already established (ProtocolConn should be nil for new connections)
-	if conn.ProtocolConn != nil {
+	if conn.ProtocolConn() != nil {
 		return protocol.ErrInvalidState
 	}
 
 	// Create the virtual protocol connection (marks connection as established)
-	conn.ProtocolConn = protocol.NewProtocolConn(s.Ctx, connectionID, s.BaseHandler)
+	conn.SetProtocolConn(protocol.NewProtocolConn(s.Ctx, connectionID, s.BaseHandler))
 	conn.StartDelivery()
 	conn.LastActivity = time.Now()
 	return protocol.ErrNone
@@ -102,7 +102,7 @@ func (s *ProxyServer) OnData(connectionID uuid.UUID, data []byte) byte {
 	// The connection is only ready to receive data once OnAck has created the
 	// virtual protocol connection. Dropping the payload here would be silent
 	// data loss, so report the unexpected state instead.
-	if conn.ProtocolConn == nil {
+	if conn.ProtocolConn() == nil {
 		return protocol.ErrInvalidState
 	}
 
@@ -132,8 +132,8 @@ func (s *ProxyServer) OnClose(connectionID uuid.UUID, errorCode byte) byte {
 // This helper reduces code duplication in handleConnection.
 func (s *ProxyServer) cleanupConnection(connID uuid.UUID, clientConn net.Conn, proxyConn *protocol.Connection) {
 	clientConn.Close()
-	if proxyConn.ProtocolConn != nil {
-		proxyConn.ProtocolConn.Close()
+	if pc := proxyConn.ProtocolConn(); pc != nil {
+		pc.Close()
 	}
 	proxyConn.Close()
 	s.Connections.Delete(connID)
@@ -204,42 +204,36 @@ func (s *ProxyServer) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	// 2. Wait for agent acknowledgment with timeout (ProtocolConn will be created in OnAck)
-	timeout := time.After(AckTimeout)
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-s.Ctx.Done():
-			s.SendClose(connID, protocol.ErrHandlerStopped)
-			s.Connections.Delete(connID)
-			return
-		case <-timeout:
-			s.SendClose(connID, protocol.ErrTransportTimeout)
-			s.Connections.Delete(connID)
-			return
-		case <-ticker.C:
-			if proxyConn.ProtocolConn != nil {
-				// Agent acknowledged connection
-				goto connected
-			}
-		}
+	// 2. Wait for the agent's acknowledgment. OnAck publishes the virtual
+	// connection and closes Established() from the receive goroutine, so we block
+	// on that signal rather than polling for the pointer.
+	select {
+	case <-s.Ctx.Done():
+		s.SendClose(connID, protocol.ErrHandlerStopped)
+		s.Connections.Delete(connID)
+		return
+	case <-time.After(AckTimeout):
+		s.SendClose(connID, protocol.ErrTransportTimeout)
+		s.Connections.Delete(connID)
+		return
+	case <-proxyConn.Established():
+		// Agent acknowledged connection.
 	}
 
-connected:
-	// 3. Connection established, start bidirectional forwarding using io.Copy
+	// 3. Connection established, start bidirectional forwarding using io.Copy.
+	// Load the virtual connection once; it is stable for the connection's life.
+	protoConn := proxyConn.ProtocolConn()
 	errCh := make(chan error, 2)
 
 	// Client → Agent
 	go func() {
-		_, err := io.Copy(proxyConn.ProtocolConn, clientConn)
+		_, err := io.Copy(protoConn, clientConn)
 		errCh <- err
 	}()
 
 	// Agent → Client
 	go func() {
-		_, err := io.Copy(clientConn, proxyConn.ProtocolConn)
+		_, err := io.Copy(clientConn, protoConn)
 		errCh <- err
 	}()
 

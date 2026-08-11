@@ -86,11 +86,14 @@ func (h *SocksHandler) handleConnect(conn *protocol.Connection, cmdData []byte) 
 //   - The context is canceled
 //   - An error occurs
 func (h *SocksHandler) handleTCPDataTransfer(conn *protocol.Connection, tcpConn net.Conn) byte {
+	// The connection is established by the time forwarding starts, so the virtual
+	// connection is set; load it once for the life of the transfer.
+	protoConn := conn.ProtocolConn()
 	errCh := make(chan error, 2)
 
 	// Client → Target
 	go func() {
-		_, err := io.Copy(tcpConn, conn.ProtocolConn)
+		_, err := io.Copy(tcpConn, protoConn)
 		// Half-close: close write side of target when client→target finishes
 		if tcpCloser, ok := tcpConn.(*net.TCPConn); ok {
 			tcpCloser.CloseWrite()
@@ -100,7 +103,7 @@ func (h *SocksHandler) handleTCPDataTransfer(conn *protocol.Connection, tcpConn 
 
 	// Target → Client
 	go func() {
-		_, err := io.Copy(conn.ProtocolConn, tcpConn)
+		_, err := io.Copy(protoConn, tcpConn)
 		errCh <- err
 	}()
 
@@ -111,12 +114,12 @@ func (h *SocksHandler) handleTCPDataTransfer(conn *protocol.Connection, tcpConn 
 		select {
 		case <-h.Ctx.Done():
 			tcpConn.Close()
-			conn.ProtocolConn.Close()
+			protoConn.Close()
 			return protocol.ErrHandlerStopped
 
 		case <-conn.Closed:
 			tcpConn.Close()
-			conn.ProtocolConn.Close()
+			protoConn.Close()
 			// Drain any remaining errors
 			select {
 			case <-errCh:
@@ -135,7 +138,7 @@ func (h *SocksHandler) handleTCPDataTransfer(conn *protocol.Connection, tcpConn 
 
 	// Both directions finished - NOW it's safe to close
 	tcpConn.Close()
-	conn.ProtocolConn.Close()
+	protoConn.Close()
 
 	// Check for errors (ignore normal EOF and closed connections)
 	for _, err := range []error{err1, err2} {
