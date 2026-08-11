@@ -56,7 +56,7 @@ func (h *SocksHandler) OnNew(connectionID uuid.UUID, data []byte) byte {
 	h.Connections.Store(conn.ID, conn)
 
 	// Create the virtual protocol connection
-	conn.ProtocolConn = protocol.NewProtocolConn(h.Ctx, connectionID, h.BaseHandler)
+	conn.SetProtocolConn(protocol.NewProtocolConn(h.Ctx, connectionID, h.BaseHandler))
 	conn.StartDelivery()
 
 	// Send ACK and process in a goroutine so ReceiveLoop never blocks on aznet writes
@@ -90,7 +90,7 @@ func (h *SocksHandler) OnData(connectionID uuid.UUID, data []byte) byte {
 
 	// Without a virtual protocol connection there is no reader for the payload.
 	// Dropping it would be silent data loss, so report the unexpected state.
-	if conn.ProtocolConn == nil {
+	if conn.ProtocolConn() == nil {
 		return protocol.ErrInvalidState
 	}
 
@@ -182,7 +182,7 @@ func (h *SocksHandler) handleAuthNegotiation(conn *protocol.Connection) byte {
 	// Use stack allocation for small fixed-size header
 	var headerBuf [2]byte
 	header := headerBuf[:]
-	if _, err := io.ReadFull(conn.ProtocolConn, header); err != nil {
+	if _, err := io.ReadFull(conn.ProtocolConn(), header); err != nil {
 		return protocol.ErrConnectionClosed
 	}
 
@@ -206,7 +206,7 @@ func (h *SocksHandler) handleAuthNegotiation(conn *protocol.Connection) byte {
 	} else {
 		methods = make([]byte, nmethods)
 	}
-	if _, err := io.ReadFull(conn.ProtocolConn, methods); err != nil {
+	if _, err := io.ReadFull(conn.ProtocolConn(), methods); err != nil {
 		return protocol.ErrConnectionClosed
 	}
 
@@ -240,7 +240,7 @@ func (h *SocksHandler) handleCommand(conn *protocol.Connection) byte {
 	// Use stack allocation for fixed-size header
 	var headerBuf [4]byte
 	header := headerBuf[:]
-	if _, err := io.ReadFull(conn.ProtocolConn, header); err != nil {
+	if _, err := io.ReadFull(conn.ProtocolConn(), header); err != nil {
 		return protocol.ErrConnectionClosed
 	}
 
@@ -267,14 +267,14 @@ func (h *SocksHandler) handleCommand(conn *protocol.Connection) byte {
 	case Domain:
 		// Read domain length first
 		var lenBuf [1]byte
-		if _, err := io.ReadFull(conn.ProtocolConn, lenBuf[:]); err != nil {
+		if _, err := io.ReadFull(conn.ProtocolConn(), lenBuf[:]); err != nil {
 			return protocol.ErrConnectionClosed
 		}
 		domainLen := int(lenBuf[0])
 		// Domain name can be up to 255 bytes, use heap allocation
 		addr = make([]byte, 1+domainLen+2) // length + domain + port
 		addr[0] = lenBuf[0]
-		if _, err := io.ReadFull(conn.ProtocolConn, addr[1:]); err != nil {
+		if _, err := io.ReadFull(conn.ProtocolConn(), addr[1:]); err != nil {
 			return protocol.ErrConnectionClosed
 		}
 	default:
@@ -284,7 +284,7 @@ func (h *SocksHandler) handleCommand(conn *protocol.Connection) byte {
 
 	// Read the address and port
 	if atyp != Domain {
-		if _, err := io.ReadFull(conn.ProtocolConn, addr); err != nil {
+		if _, err := io.ReadFull(conn.ProtocolConn(), addr); err != nil {
 			return protocol.ErrConnectionClosed
 		}
 	}

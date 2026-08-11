@@ -3,6 +3,7 @@ package protocol
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,8 +13,8 @@ import (
 // It is safe for concurrent use by multiple goroutines.
 //
 // Connection state is determined by:
-//   - ProtocolConn == nil: connection is pending acknowledgment
-//   - ProtocolConn != nil && Closed not signaled: connection is active
+//   - ProtocolConn() == nil: connection is pending acknowledgment
+//   - ProtocolConn() != nil && Closed not signaled: connection is active
 //   - Closed signaled: connection is terminated
 type Connection struct {
 	// ID uniquely identifies the connection
@@ -22,8 +23,16 @@ type Connection struct {
 	// Conn holds the network connection (could be real or virtual ProtocolConn)
 	Conn net.Conn
 
-	// ProtocolConn is the virtual connection for protocol-based data transfer
-	ProtocolConn *ProtocolConn
+	// protoConn is the virtual connection for protocol-based data transfer. It is
+	// published from the receive goroutine (via SetProtocolConn on acknowledgment)
+	// and read from the connection-handling goroutine, so it is held behind an
+	// atomic pointer; access it through ProtocolConn()/SetProtocolConn.
+	protoConn atomic.Pointer[ProtocolConn]
+
+	// established is closed exactly once when protoConn is first set, so a waiter
+	// can block on acknowledgment via a select instead of polling.
+	established     chan struct{}
+	establishedOnce sync.Once
 
 	// Closed signals connection termination
 	Closed chan struct{}
@@ -67,6 +76,7 @@ func NewConnection(id uuid.UUID, stop <-chan struct{}) *Connection {
 	return &Connection{
 		ID:           id,
 		Closed:       make(chan struct{}),
+		established:  make(chan struct{}),
 		deliverCh:    make(chan []byte, 1024),
 		stop:         stop,
 		CreatedAt:    time.Now(),
@@ -74,13 +84,33 @@ func NewConnection(id uuid.UUID, stop <-chan struct{}) *Connection {
 	}
 }
 
+// ProtocolConn returns the virtual connection, or nil if the connection has not
+// yet been acknowledged.
+func (c *Connection) ProtocolConn() *ProtocolConn {
+	return c.protoConn.Load()
+}
+
+// SetProtocolConn publishes the virtual connection and signals establishment.
+// The first call unblocks any waiter on Established(); later calls only update
+// the pointer (the signal fires once).
+func (c *Connection) SetProtocolConn(pc *ProtocolConn) {
+	c.protoConn.Store(pc)
+	c.establishedOnce.Do(func() { close(c.established) })
+}
+
+// Established returns a channel closed once the connection has been
+// acknowledged and its virtual connection published.
+func (c *Connection) Established() <-chan struct{} {
+	return c.established
+}
+
 // Close terminates the connection and its resources.
 // Safe to call multiple times (guarded by closeOnce). Returns ErrNone.
 func (c *Connection) Close() byte {
 	c.closeOnce.Do(func() {
 		close(c.Closed)
-		if c.ProtocolConn != nil {
-			c.ProtocolConn.Shutdown()
+		if pc := c.ProtocolConn(); pc != nil {
+			pc.Shutdown()
 		}
 		if c.Conn != nil {
 			c.Conn.Close()
@@ -122,9 +152,11 @@ func (c *Connection) Deliver(data []byte) bool {
 	}
 }
 
-// StartDelivery launches a goroutine that drains deliverCh into ProtocolConn.DeliverData.
-// Must be called after ProtocolConn is set.
+// StartDelivery launches a goroutine that drains deliverCh into the virtual
+// connection. Must be called after SetProtocolConn, whose store happens-before
+// this load.
 func (c *Connection) StartDelivery() {
+	pc := c.ProtocolConn()
 	go func() {
 		for {
 			select {
@@ -132,7 +164,7 @@ func (c *Connection) StartDelivery() {
 				if !ok {
 					return
 				}
-				c.ProtocolConn.DeliverData(data)
+				pc.DeliverData(data)
 			case <-c.Closed:
 				return
 			}

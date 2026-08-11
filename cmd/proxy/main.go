@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/desertbit/grumble"
@@ -67,12 +68,32 @@ type ListenerState struct {
 
 // AgentConnection tracks a connected agent.
 type AgentConnection struct {
-	ID         string    // connection ID
-	Conn       net.Conn  // aznet connection
-	ListenerID string    // ID of the listener this agent connected to
-	Info       string    // agent identity (user@host)
-	LastSeen   time.Time // last message received from agent
-	CreatedAt  time.Time // connection time
+	ID         string   // connection ID
+	Conn       net.Conn // aznet connection
+	ListenerID string   // ID of the listener this agent connected to
+	Info       string   // agent identity (user@host)
+
+	// LastSeen is the Unix-nanos timestamp of the last message received from the
+	// agent. It is written from the receive goroutine (via the OnReceive
+	// callback) and read from the CLI goroutine, so it is accessed atomically to
+	// avoid a torn read of a multi-word time.Time. Use lastSeen()/setLastSeen.
+	LastSeen atomic.Int64
+
+	CreatedAt time.Time // connection time
+}
+
+// lastSeen returns the last-seen time, or the zero time if never set.
+func (a *AgentConnection) lastSeen() time.Time {
+	ns := a.LastSeen.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// setLastSeen records t as the last-seen time.
+func (a *AgentConnection) setLastSeen(t time.Time) {
+	a.LastSeen.Store(t.UnixNano())
 }
 
 // AgentInfo tracks connected agent metadata for display.
@@ -432,9 +453,9 @@ func AcceptAgentLoopForListener(ctx context.Context, listenerID string, listener
 			Conn:       conn,
 			ListenerID: listenerID,
 			Info:       info,
-			LastSeen:   now,
 			CreatedAt:  now,
 		}
+		agent.setLastSeen(now)
 		connectedAgents.Store(agentID, agent)
 
 		log.Info().Str("agent_id", agentID).Str("info", info).Str("listener_id", listenerID).Msg("Agent connected")
@@ -634,7 +655,7 @@ func RenderAgentTable(agents []AgentInfo) string {
 			a.ListenerID,
 			a.ProxyPort,
 			a.CreatedAt.Format("2006-01-02 15:04:05"),
-			formatRelativeTime(a.LastSeen),
+			formatRelativeTime(a.lastSeen()),
 		})
 	}
 
@@ -914,7 +935,7 @@ func AddCommands(app *grumble.App) {
 
 			// Set callback to update LastSeen on every received packet
 			proxyServer.OnReceive = func() {
-				agent.LastSeen = time.Now()
+				agent.setLastSeen(time.Now())
 			}
 
 			listenAddr := c.Flags.String("listen")
