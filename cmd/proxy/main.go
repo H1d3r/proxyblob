@@ -867,7 +867,6 @@ func AddCommands(app *grumble.App) {
 				return nil
 			}
 
-			c.App.Println("Agents:")
 			c.App.Println(RenderAgentTable(agents))
 			return nil
 		},
